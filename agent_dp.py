@@ -509,7 +509,9 @@ def deep_barca_move(obs: pybl.Observation, rng: random.Random | None = None, deb
         else:
             flags, owners = _flags_of(sample, me)
             # 補充で引くカードは考慮しない (論文と同じく, カードを置いた直後の局面を評価する)
-            hand_after = hand & ~_bit(pybl.move_card(move))
+            # move_card は numpy.int8 を返すため, Python の int に変換してからビット演算する
+            # (numpy のまま計算すると, Windows では 32 ビットの整数として扱われてオーバーフローする)
+            hand_after = hand & ~_bit(int(pybl.move_card(move)))
             score = evaluator.evaluate(flags, owners, hand_after)
             if debug:
                 after[move] = (flags, owners, hand_after)
