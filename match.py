@@ -2,12 +2,13 @@
 """エージェント同士を指定回数対戦させ, 成績を表示する.
 
 使い方:
-    python3 match.py 試合数 エージェント1 エージェント2 [--first {1,2,alt}] [--seed N] [--quiet]
+    python3 match.py 試合数 エージェント1 エージェント2 [--first {1,2,alt}] [--seed N] [--quiet] [-j N]
 
     python3 match.py 100 ab random                # 先手は交互 (既定)
     python3 match.py 100 ab random --first 1      # 常にエージェント1が先手
     python3 match.py 100 ab random --first 2      # 常にエージェント2が先手
     python3 match.py 100 ab ab --seed 0           # 同じ対局を再現できるようにする
+    python3 match.py 100 ab dp -j 4               # 4試合ずつ並列に対戦させる (-j 0 で CPU のコア数)
 
 エージェントの指定:
     random                    agent_random.random_move
@@ -29,10 +30,12 @@
 """
 import argparse
 import importlib
+import os
 import inspect
 import random
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -140,6 +143,63 @@ def play_game(agents: dict, state: pybl.GameState, rngs: dict) -> None:
         state.play(move)
 
 
+@dataclass
+class GameTask:
+    """1試合の条件. 並列実行のため, 別のプロセスに渡せる値だけを持つ"""
+    index: int
+    agent1_spec: str
+    agent2_spec: str
+    agent1_first: bool
+    state_seed: int
+    first_seed: int     # 先手のエージェントに渡す乱数のシード
+    second_seed: int    # 後手のエージェントに渡す乱数のシード
+
+
+@dataclass
+class GameResult:
+    index: int
+    agent1_first: bool
+    winner: int         # 1 = エージェント1の勝ち, 2 = エージェント2の勝ち, 0 = 引き分け
+    move_count: int
+    forced: bool
+    think_time: tuple   # (エージェント1, エージェント2) の思考時間の合計 (秒)
+    agent_moves: tuple  # (エージェント1, エージェント2) の着手数
+
+
+# 各プロセスで読み込んだエージェント (エージェント1/2 の別ごとに1つ)
+_loaded_agents = {}
+
+
+def _agent_for(slot: int, spec: str) -> Agent:
+    key = (slot, spec)
+    if key not in _loaded_agents:
+        _loaded_agents[key] = load_agent(spec)
+    return _loaded_agents[key]
+
+
+def run_game(task: GameTask) -> GameResult:
+    """1試合を行い, 結果を返す (並列実行では別のプロセスで呼ばれる)"""
+    agent1, agent2 = _agent_for(1, task.agent1_spec), _agent_for(2, task.agent2_spec)
+    before = [(a.think_time, a.move_count) for a in (agent1, agent2)]
+
+    state = pybl.GameState(seed=task.state_seed)
+    first, second = state.first_player, pybl.to_opponent(state.first_player)
+    agents = {first: agent1, second: agent2} if task.agent1_first else {first: agent2, second: agent1}
+    rngs = {first: random.Random(task.first_seed), second: random.Random(task.second_seed)}
+    play_game(agents, state, rngs)
+
+    if state.winner == pybl.NULL_PLAYER:
+        winner = 0
+    else:
+        winner = 1 if agents[state.winner] is agent1 else 2
+    return GameResult(
+        index=task.index, agent1_first=task.agent1_first, winner=winner, move_count=state.move_count,
+        forced=bool(state.is_forced_termination),
+        think_time=tuple(a.think_time - t for a, (t, _) in zip((agent1, agent2), before)),
+        agent_moves=tuple(a.move_count - m for a, (_, m) in zip((agent1, agent2), before)),
+    )
+
+
 def rate(wins: int, draws: int, games: int) -> str:
     return f"{(wins + 0.5 * draws) / games * 100:5.1f}%" if games else "   - "
 
@@ -174,40 +234,58 @@ def main():
                         help="先手: 1 = エージェント1, 2 = エージェント2, alt = 交互 (既定, 1試合目はエージェント1が先手)")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード (指定すると同じ対局を再現できる)")
     parser.add_argument("--quiet", action="store_true", help="試合ごとの結果を表示しない")
+    parser.add_argument("-j", "--jobs", type=int, default=1,
+                        help="同時に行う試合数 (並列化数). 既定は1 (並列化しない), 0 で CPU のコア数")
     args = parser.parse_args()
 
     if args.games <= 0:
         parser.error("試合数は1以上を指定してください")
+    if args.jobs < 0:
+        parser.error("並列化数は0以上を指定してください")
+    jobs = min(args.games, args.jobs or os.cpu_count() or 1)
 
     # エージェントのモジュールをこのファイルと同じディレクトリから読み込めるようにする
+    # (並列実行のプロセスにも sys.path が引き継がれる)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     agent1, agent2 = load_agent(args.agent1), load_agent(args.agent2)
     if agent1.name == agent2.name:
         agent1.name, agent2.name = f"{agent1.name}(1)", f"{agent2.name}(2)"
 
+    # 各試合の乱数のシードを先に決めておくことで, 並列化数によらず同じシードなら同じ結果になる
     master = random.Random(args.seed)
+    tasks = []
+    for game in range(args.games):
+        state_seed = master.getrandbits(64)
+        first_seed, second_seed = master.getrandbits(64), master.getrandbits(64)
+        agent1_first = args.first == "1" or (args.first == "alt" and game % 2 == 0)
+        tasks.append(GameTask(game, args.agent1, args.agent2, agent1_first, state_seed, first_seed, second_seed))
+
+    if jobs > 1:
+        print(f"{jobs} 試合ずつ並列に対戦させます", flush=True)
     total_moves = forced = 0
     start = time.perf_counter()
 
-    for game in range(args.games):
-        state = pybl.GameState(seed=master.getrandbits(64))
-        agent1_first = args.first == "1" or (args.first == "alt" and game % 2 == 0)
-        first, second = state.first_player, pybl.to_opponent(state.first_player)
-        agents = {first: agent1, second: agent2} if agent1_first else {first: agent2, second: agent1}
-        rngs = {p: random.Random(master.getrandbits(64)) for p in (first, second)}
+    executor = ProcessPoolExecutor(max_workers=jobs) if jobs > 1 else None
+    try:
+        # 試合の番号順に結果を受け取る (並列実行でも表示の順番は変わらない)
+        results = executor.map(run_game, tasks) if executor else map(run_game, tasks)
+        for result in results:
+            total_moves += result.move_count
+            forced += result.forced
+            for slot, agent in ((1, agent1), (2, agent2)):
+                outcome = 2 if result.winner == 0 else 0 if result.winner == slot else 1
+                agent.record(outcome, is_first=result.agent1_first == (slot == 1))
+                agent.think_time += result.think_time[slot - 1]
+                agent.move_count += result.agent_moves[slot - 1]
 
-        play_game(agents, state, rngs)
-
-        total_moves += state.move_count
-        forced += state.is_forced_termination
-        for player, agent in agents.items():
-            outcome = 2 if state.winner == pybl.NULL_PLAYER else 0 if state.winner == player else 1
-            agent.record(outcome, is_first=player == first)
-
-        if not args.quiet:
-            winner = "引き分け" if state.winner == pybl.NULL_PLAYER else f"{agents[state.winner].name} の勝ち"
-            print(f"{game + 1:>{len(str(args.games))}}/{args.games}  先手: {agents[first].name:<12} "
-                  f"{winner:<16} ({state.move_count} 手)", flush=True)
+            if not args.quiet:
+                first_name = agent1.name if result.agent1_first else agent2.name
+                winner = "引き分け" if result.winner == 0 else f"{(agent1, agent2)[result.winner - 1].name} の勝ち"
+                print(f"{result.index + 1:>{len(str(args.games))}}/{args.games}  先手: {first_name:<12} "
+                      f"{winner:<16} ({result.move_count} 手)", flush=True)
+    finally:
+        if executor:
+            executor.shutdown(cancel_futures=True)
 
     print_summary(agent1, agent2, args.games, total_moves, forced, time.perf_counter() - start)
 
