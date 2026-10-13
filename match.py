@@ -15,6 +15,7 @@
     mon                       agent_mon.montecarlo_move
     ismcts                    agent_ismcts.ismcts_move
     root                      agent_root.root_ismcts_move
+    dp                        agent_dp.deep_barca_move
     モジュール名:関数名        例: agent_ab:alphabeta_move
 
 エージェントは「局面を受け取って着手を返す関数」です. 公平のため, 手番のプレイヤーから見える情報
@@ -38,6 +39,7 @@ AGENTS = {
     "mon": ("agent_mon", "montecarlo_move"),
     "ismcts": ("agent_ismcts", "ismcts_move"),
     "root": ("agent_root", "root_ismcts_move"),
+    "dp": ("agent_dp", "deep_barca_move"),
 }
 
 
@@ -131,8 +133,8 @@ def print_summary(agent1: Agent, agent2: Agent, games: int, total_moves: int, fo
 def main():
     parser = argparse.ArgumentParser(description="エージェント同士を指定回数対戦させる")
     parser.add_argument("games", type=int, help="試合数")
-    parser.add_argument("agent1", help="エージェント1 (random, ab, mon, ismcts, root, または モジュール名:関数名)")
-    parser.add_argument("agent2", help="エージェント2 (random, ab, mon, ismcts, root, または モジュール名:関数名)")
+    parser.add_argument("agent1", help="エージェント1 (random, ab, mon, ismcts, root, dp, または モジュール名:関数名)")
+    parser.add_argument("agent2", help="エージェント2 (random, ab, mon, ismcts, root, dp, または モジュール名:関数名)")
     parser.add_argument("--first", choices=["1", "2", "alt"], default="alt",
                         help="先手: 1 = エージェント1, 2 = エージェント2, alt = 交互 (既定, 1試合目はエージェント1が先手)")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード (指定すると同じ対局を再現できる)")
