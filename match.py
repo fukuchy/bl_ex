@@ -2,13 +2,14 @@
 """エージェント同士を指定回数対戦させ, 成績を表示する.
 
 使い方:
-    python3 match.py 試合数 エージェント1 エージェント2 [--first {1,2,alt}] [--seed N] [--quiet] [-j N]
+    python3 match.py 試合数 エージェント1 エージェント2 [--first {1,2,alt}] [--seed N] [--interval N] [--quiet] [-j N]
 
     python3 match.py 100 ab random                # 先手は交互 (既定)
     python3 match.py 100 ab random --first 1      # 常にエージェント1が先手
     python3 match.py 100 ab random --first 2      # 常にエージェント2が先手
     python3 match.py 100 ab ab --seed 0           # 同じ対局を再現できるようにする
     python3 match.py 100 ab dp -j 4               # 4試合ずつ並列に対戦させる (-j 0 で CPU のコア数)
+    python3 match.py 100 ab dp --interval 10      # 10試合ごとに途中経過 (通算成績) を表示する
 
 エージェントの指定:
     random                    agent_random.random_move
@@ -233,7 +234,10 @@ def main():
     parser.add_argument("--first", choices=["1", "2", "alt"], default="alt",
                         help="先手: 1 = エージェント1, 2 = エージェント2, alt = 交互 (既定, 1試合目はエージェント1が先手)")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード (指定すると同じ対局を再現できる)")
-    parser.add_argument("--quiet", action="store_true", help="試合ごとの結果を表示しない")
+    parser.add_argument("--interval", type=int, default=1,
+                        help="途中経過を表示する間隔 (試合数). 既定は1 (1試合ごとに結果を表示), "
+                             "2以上なら指定した試合数ごとに通算成績を表示する")
+    parser.add_argument("--quiet", action="store_true", help="途中経過を表示しない")
     parser.add_argument("-j", "--jobs", type=int, default=1,
                         help="同時に行う試合数 (並列化数). 既定は1 (並列化しない), 0 で CPU のコア数")
     args = parser.parse_args()
@@ -242,6 +246,8 @@ def main():
         parser.error("試合数は1以上を指定してください")
     if args.jobs < 0:
         parser.error("並列化数は0以上を指定してください")
+    if args.interval <= 0:
+        parser.error("途中経過を表示する間隔は1以上を指定してください")
     jobs = min(args.games, args.jobs or os.cpu_count() or 1)
 
     # エージェントのモジュールをこのファイルと同じディレクトリから読み込めるようにする
@@ -278,11 +284,19 @@ def main():
                 agent.think_time += result.think_time[slot - 1]
                 agent.move_count += result.agent_moves[slot - 1]
 
-            if not args.quiet:
+            done = result.index + 1
+            progress = f"{done:>{len(str(args.games))}}/{args.games}"
+            if args.quiet:
+                pass
+            elif args.interval == 1:
                 first_name = agent1.name if result.agent1_first else agent2.name
                 winner = "引き分け" if result.winner == 0 else f"{(agent1, agent2)[result.winner - 1].name} の勝ち"
-                print(f"{result.index + 1:>{len(str(args.games))}}/{args.games}  先手: {first_name:<12} "
-                      f"{winner:<16} ({result.move_count} 手)", flush=True)
+                print(f"{progress}  先手: {first_name:<12} {winner:<16} ({result.move_count} 手)", flush=True)
+            elif done % args.interval == 0 or done == args.games:
+                # 通算成績 (エージェント1から見た勝ち-負け-引分と勝率)
+                print(f"{progress}  {agent1.name} {agent1.wins}勝 {agent1.losses}敗 {agent1.draws}分 "
+                      f"({rate(agent1.wins, agent1.draws, done).strip()})  vs  {agent2.name}  "
+                      f"[経過 {time.perf_counter() - start:.0f} 秒]", flush=True)
     finally:
         if executor:
             executor.shutdown(cancel_futures=True)
