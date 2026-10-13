@@ -19,8 +19,8 @@ import random
 
 import pybl
 
-NUM_ITERATIONS = 3000  # 1手あたりの反復回数 (仕様 7章. 初期値 1,000 から変更)
-EXPLORATION = 0.7       # UCB1 の探索係数 c (仕様 7章)
+NUM_ITERATIONS = 30000  # 1手あたりの反復回数 (仕様 7章. 初期値 1,000 から変更)
+EXPLORATION = 0.1       # UCB1 の探索係数 c (仕様 7章)
 
 _default_rng = random.Random()
 
