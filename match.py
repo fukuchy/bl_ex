@@ -16,7 +16,13 @@
     ismcts                    agent_ismcts.ismcts_move
     root                      agent_root.root_ismcts_move
     dp                        agent_dp.deep_barca_move
+    abdeck                    agent_abDeck.abdeck_move
     モジュール名:関数名        例: agent_ab:alphabeta_move
+
+エージェントの引数の指定 (エージェント名の後ろに @引数名=値 を付ける. 複数ある場合はカンマで区切る):
+    abdeck@depth=3                    探索の深さを 3 にする
+    abdeck@depth=3,num_samples=16     探索の深さを 3, 生成する局面の数を 16 にする
+    mon@num_playouts=10000            プレイアウトの総数を 10000 にする
 
 エージェントは「局面を受け取って着手を返す関数」です. 公平のため, 手番のプレイヤーから見える情報
 (pybl.Observation) のみを渡します. 関数が rng 引数を受け取る場合は, 試合ごとに random.Random を渡します.
@@ -40,6 +46,7 @@ AGENTS = {
     "ismcts": ("agent_ismcts", "ismcts_move"),
     "root": ("agent_root", "root_ismcts_move"),
     "dp": ("agent_dp", "deep_barca_move"),
+    "abdeck": ("agent_abDeck", "abdeck_move"),
 }
 
 
@@ -48,6 +55,7 @@ class Agent:
     name: str
     func: object
     accepts_rng: bool
+    kwargs: dict = field(default_factory=dict)                      # 着手のたびに関数へ渡す引数
     wins: int = 0
     losses: int = 0
     draws: int = 0
@@ -58,7 +66,10 @@ class Agent:
 
     def choose(self, obs: pybl.Observation, rng: random.Random):
         start = time.perf_counter()
-        move = self.func(obs, rng=rng) if self.accepts_rng else self.func(obs)
+        if self.accepts_rng:
+            move = self.func(obs, rng=rng, **self.kwargs)
+        else:
+            move = self.func(obs, **self.kwargs)
         self.think_time += time.perf_counter() - start
         self.move_count += 1
         return move
@@ -74,13 +85,32 @@ class Agent:
             self.draws += 1
 
 
+def _parse_value(text: str):
+    """引数の値を int, float, 文字列の順に解釈する"""
+    for convert in (int, float):
+        try:
+            return convert(text)
+        except ValueError:
+            pass
+    return text
+
+
 def load_agent(spec: str) -> Agent:
-    module_name, sep, func_name = spec.partition(":")
+    """エージェントの指定 (名前, モジュール名:関数名, 後ろに @引数名=値,... を付けてもよい) から Agent を作る"""
+    target, _, params = spec.partition("@")
+    kwargs = {}
+    for item in filter(None, params.split(",")):
+        key, eq, value = item.partition("=")
+        if not eq or not key:
+            raise SystemExit(f"エージェントの引数は 引数名=値 の形で指定してください: {item}")
+        kwargs[key.strip()] = _parse_value(value.strip())
+
+    module_name, sep, func_name = target.partition(":")
     if not sep:
-        if spec not in AGENTS:
-            raise SystemExit(f"不明なエージェントです: {spec} (指定できる名前: {', '.join(AGENTS)}, "
+        if target not in AGENTS:
+            raise SystemExit(f"不明なエージェントです: {target} (指定できる名前: {', '.join(AGENTS)}, "
                              f"または モジュール名:関数名)")
-        module_name, func_name = AGENTS[spec]
+        module_name, func_name = AGENTS[target]
 
     try:
         module = importlib.import_module(module_name)
@@ -90,8 +120,13 @@ def load_agent(spec: str) -> Agent:
     if not callable(func):
         raise SystemExit(f"{module_name} に関数 {func_name} がありません")
 
-    accepts_rng = "rng" in inspect.signature(func).parameters
-    return Agent(name=spec, func=func, accepts_rng=accepts_rng)
+    parameters = inspect.signature(func).parameters
+    unknown = [key for key in kwargs if key not in parameters or key in ("obs", "rng")]
+    if unknown:
+        accepted = [name for name in parameters if name not in ("obs", "rng")]
+        raise SystemExit(f"{func_name} は引数 {', '.join(unknown)} を受け取りません "
+                         f"(指定できる引数: {', '.join(accepted) or 'なし'})")
+    return Agent(name=spec, func=func, accepts_rng="rng" in parameters, kwargs=kwargs)
 
 
 def play_game(agents: dict, state: pybl.GameState, rngs: dict) -> None:
@@ -133,8 +168,8 @@ def print_summary(agent1: Agent, agent2: Agent, games: int, total_moves: int, fo
 def main():
     parser = argparse.ArgumentParser(description="エージェント同士を指定回数対戦させる")
     parser.add_argument("games", type=int, help="試合数")
-    parser.add_argument("agent1", help="エージェント1 (random, ab, mon, ismcts, root, dp, または モジュール名:関数名)")
-    parser.add_argument("agent2", help="エージェント2 (random, ab, mon, ismcts, root, dp, または モジュール名:関数名)")
+    parser.add_argument("agent1", help="エージェント1 (random, ab, mon, ismcts, root, dp, abdeck, または モジュール名:関数名. @引数名=値 で引数を指定)")
+    parser.add_argument("agent2", help="エージェント2 (random, ab, mon, ismcts, root, dp, abdeck, または モジュール名:関数名. @引数名=値 で引数を指定)")
     parser.add_argument("--first", choices=["1", "2", "alt"], default="alt",
                         help="先手: 1 = エージェント1, 2 = エージェント2, alt = 交互 (既定, 1試合目はエージェント1が先手)")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード (指定すると同じ対局を再現できる)")

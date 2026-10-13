@@ -7,9 +7,11 @@
     python3 play_vs_agent.py ab                 # アルファベータ法のエージェントと対戦 (先手はランダム)
     python3 play_vs_agent.py dp --first you     # あなたが先手
     python3 play_vs_agent.py ismcts --first agent --seed 42
+    python3 play_vs_agent.py abdeck@depth=3     # エージェントの引数を指定する (@引数名=値, 複数はカンマ区切り)
 
 エージェントの指定 (match.py と同じ):
-    random, ab, mon, ismcts, root, dp, または モジュール名:関数名 (例: agent_ab:alphabeta_move)
+    random, ab, mon, ismcts, root, dp, abdeck, または モジュール名:関数名 (例: agent_ab:alphabeta_move)
+    後ろに @引数名=値 を付けると, エージェントの関数に引数を渡せる (例: abdeck@depth=3,num_samples=16)
 
 エージェントには公平のため, エージェントから見える情報 (pybl.Observation) のみを渡します.
 
@@ -35,7 +37,8 @@ from match import AGENTS, load_agent
 
 def main():
     parser = argparse.ArgumentParser(description="あなたと指定したエージェントでバトルラインを対戦する")
-    parser.add_argument("agent", help=f"対戦するエージェント ({', '.join(AGENTS)}, または モジュール名:関数名)")
+    parser.add_argument("agent", help=f"対戦するエージェント ({', '.join(AGENTS)}, または モジュール名:関数名. "
+                                      f"@引数名=値 で引数を指定)")
     parser.add_argument("--first", choices=["you", "agent", "random"], default="random", help="先手 (既定はランダム)")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード (配札とエージェントの乱数を固定する)")
     parser.add_argument("--no-color", action="store_true", help="色を付けない")
