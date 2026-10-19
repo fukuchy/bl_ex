@@ -19,12 +19,14 @@
     root                      agent_root.root_ismcts_move
     dp                        agent_dp.deep_barca_move
     abdeck                    agent_abDeck.abdeck_move
+    beam                      agent_beam.beam_move
     モジュール名:関数名        例: agent_ab:alphabeta_move
 
 エージェントの引数の指定 (エージェント名の後ろに @引数名=値 を付ける. 複数ある場合はカンマで区切る):
     abdeck@depth=3                    探索の深さを 3 にする
     abdeck@depth=3,num_samples=16     探索の深さを 3, 生成する局面の数を 16 にする
     mon@num_playouts=10000            プレイアウトの総数を 10000 にする
+    beam@depth=4,num_samples=4,beam_width=5   ビームサーチの深さ・サンプル数・ビーム幅を指定する
 
 エージェントは「局面を受け取って着手を返す関数」です. 公平のため, 手番のプレイヤーから見える情報
 (pybl.Observation) のみを渡します. 関数が rng 引数を受け取る場合は, 試合ごとに random.Random を渡します.
@@ -51,6 +53,7 @@ AGENTS = {
     "root": ("agent_root", "root_ismcts_move"),
     "dp": ("agent_dp", "deep_barca_move"),
     "abdeck": ("agent_abDeck", "abdeck_move"),
+    "beam": ("agent_beam", "beam_move"),
 }
 
 
@@ -229,8 +232,8 @@ def print_summary(agent1: Agent, agent2: Agent, games: int, total_moves: int, fo
 def main():
     parser = argparse.ArgumentParser(description="エージェント同士を指定回数対戦させる")
     parser.add_argument("games", type=int, help="試合数")
-    parser.add_argument("agent1", help="エージェント1 (random, ab, mon, ismcts, root, dp, abdeck, または モジュール名:関数名. @引数名=値 で引数を指定)")
-    parser.add_argument("agent2", help="エージェント2 (random, ab, mon, ismcts, root, dp, abdeck, または モジュール名:関数名. @引数名=値 で引数を指定)")
+    parser.add_argument("agent1", help="エージェント1 (random, ab, mon, ismcts, root, dp, abdeck, beam, または モジュール名:関数名. @引数名=値 で引数を指定)")
+    parser.add_argument("agent2", help="エージェント2 (random, ab, mon, ismcts, root, dp, abdeck, beam, または モジュール名:関数名. @引数名=値 で引数を指定)")
     parser.add_argument("--first", choices=["1", "2", "alt"], default="alt",
                         help="先手: 1 = エージェント1, 2 = エージェント2, alt = 交互 (既定, 1試合目はエージェント1が先手)")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード (指定すると同じ対局を再現できる)")
