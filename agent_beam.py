@@ -1,31 +1,32 @@
-"""ビームサーチ (各局面で評価値の上位の手だけを深く読む) で着手を選ぶエージェント.
+"""ビームサーチ (各深さで評価値の上位 beam_width 個のノードだけを残す) で着手を選ぶエージェント.
 
-agent_ab.py / agent_abDeck.py のアルファベータ法を基にしている. 違いは, 探索の各局面で全ての合法手を
-1手先の評価値で並べ, 上位 beam_width 個の手だけを次の深さで読む (それ以外の手はその場で打ち切る) 点である.
-自分の手番では自分にとって評価値の高い手を, 相手の手番では相手にとって評価値の高い手を残す.
-残した手の中では, 従来どおりアルファベータ法の枝刈りも行う.
+agent_ab.py / agent_abDeck.py のアルファベータ法のエージェントを基にしている (評価関数, 局面の生成,
+最善手への投票, 山札が無くなった後の読み切りは同じ). 探索は次のように行う.
+
+1. 展開: その深さに残したノード (根の深さでは根だけ) の全ての合法手を指し, 評価関数で採点する
+2. 選択: 展開した全ての子の中から, その手を指したプレイヤーから見て評価値が高い上位 beam_width 個だけを
+   次の深さで展開する (自分の手番の深さでは自分の有力な手, 相手の手番の深さでは相手の有力な応手を残す)
+3. 値の計算: 作った木の上で, 葉から根に向かってミニマックス法で値を求める. 展開しなかった子は
+   採点した評価値をそのまま使うので, 各ノードの値はそのノードの全ての合法手を考慮した値になる
+
+各深さに残すノードは beam_width 個だけなので, 計算量 (評価関数の呼び出し回数) は深さに比例する:
+    num_samples × 合法手の数 (最大63) × (1 + beam_width × (depth - 1))
 
 - 探索開始時に, 相手の手札と山札の順番をランダムに決めた局面を num_samples 通り生成し,
   それぞれで探索して最善手に投票する (agent_abDeck.py と同じ)
-- 最後の深さでは, 並べ替えのために計算した評価値をそのまま使うので, 全ての合法手を考慮する
 - 山札が無くなった後は局面が確定するため, ビームサーチは使わず agent_ab.py と同じく終局まで読み切る
-- 評価関数は agent_ab.py と同じものを使う
-
-計算量の目安 (評価関数の呼び出し回数): num_samples × 合法手の数 × beam_width^(depth - 1)
-(アルファベータ法では num_samples × 合法手の数^(depth / 2) 程度なので, 深い探索がしやすい)
 
 実行時の指定 (match.py / play_vs_agent.py):
-    python3 match.py 100 beam@depth=4,num_samples=4,beam_width=5 abdeck@depth=3,num_samples=4
+    python3 match.py 100 beam@depth=6,num_samples=4,beam_width=8 abdeck@depth=3,num_samples=4
 
 使い方:
     import pybl
     from agent_beam import beam_move
 
     state = pybl.GameState()
-    move = beam_move(state.observe(state.side_to_move), depth=4, num_samples=4, beam_width=5)
+    move = beam_move(state.observe(state.side_to_move), depth=6, num_samples=4, beam_width=8)
     state.play(move)
 """
-import math
 import random
 from collections import defaultdict
 
@@ -33,68 +34,80 @@ import pybl
 
 from agent_ab import _search_root, _terminal_score, evaluate
 
-DEPTH = 4               # 山札が残っている間の探索の深さ (手数)
+DEPTH = 6               # 山札が残っている間の探索の深さ (手数)
 NUM_SAMPLES = 4         # 探索開始時に生成する局面 (相手の手札と山札の組み合わせ) の数
-BEAM_WIDTH = 4          # 各局面で次の深さに進める手の数 (評価値の上位から)
+BEAM_WIDTH = 8          # 各深さで次の深さに進める (展開する) ノードの数
 ENDGAME_DEPTH = 20      # 山札が無くなった後の探索の深さ (終局まで読み切るのに十分な深さ)
 
 _default_rng = random.Random()
 
 
-def _scored_moves(state, ply: int) -> list:
-    """全ての合法手を, 指した直後の局面の評価値 (手を指すプレイヤーから見た値) の高い順に並べて返す.
+class _Node:
+    """ビームサーチの木のノード"""
+    __slots__ = ("move", "parent", "score", "terminal", "children", "state")
 
-    返り値は (評価値, 着手) のリスト. ply は state の根からの手数 (終局時の評価値の補正に使う)
-    """
-    scored = []
+    def __init__(self, move, parent, score: float, terminal: bool):
+        self.move = move            # このノードに至った着手 (根は None)
+        self.parent = parent
+        self.score = score          # このノードの手番のプレイヤーから見た評価値 (終局なら終局の評価値)
+        self.terminal = terminal
+        self.children = []          # 展開した場合の子ノード (全ての合法手)
+        self.state = None           # 展開するノードの局面 (展開後は不要なので破棄する)
+
+    def value(self) -> float:
+        """このノードの手番のプレイヤーから見た値 (展開した子があればミニマックス法で求める)"""
+        if not self.children:
+            return self.score
+        return max(-child.value() for child in self.children)
+
+
+def _expand(node: _Node, ply: int) -> list:
+    """node の全ての合法手を指して採点し, 子ノードのリストを返す"""
+    state = node.state
     for move in state.get_legal_moves().tolist():
         state.play(move)
-        value = -_terminal_score(state, ply + 1) if state.is_terminal else -evaluate(state)
+        if state.is_terminal:
+            child = _Node(move, node, _terminal_score(state, ply + 1), True)
+        else:
+            child = _Node(move, node, evaluate(state), False)
         state.undo()
-        scored.append((value, move))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored
-
-
-def _beam_negamax(state, depth: int, alpha: float, beta: float, ply: int, beam_width: int) -> float:
-    if state.is_terminal:
-        return _terminal_score(state, ply)
-    if depth == 0:
-        return evaluate(state)
-
-    scored = _scored_moves(state, ply)
-    if depth == 1:
-        return scored[0][0]     # 最後の深さでは, 並べ替えに使った評価値がそのまま子の値になる
-
-    best = -math.inf
-    for _, move in scored[:beam_width]:
-        state.play(move)
-        value = -_beam_negamax(state, depth - 1, -beta, -alpha, ply + 1, beam_width)
-        state.undo()
-        if value > best:
-            best = value
-        if value > alpha:
-            alpha = value
-        if alpha >= beta:
-            break
-    return best
+        node.children.append(child)
+    node.state = None
+    return node.children
 
 
 def _beam_search_root(state, depth: int, beam_width: int):
     """state の手番のプレイヤーの最善手と評価値を, ビームサーチで求める"""
-    scored = _scored_moves(state, 0)
-    if depth == 1:
-        value, move = scored[0]
-        return move, value
+    root = _Node(None, None, 0.0, False)
+    root.state = state
+    frontier = [root]
+    for level in range(depth):
+        children = []
+        for node in frontier:
+            children.extend(_expand(node, level))
+        if level == depth - 1:
+            break
+        # その手を指したプレイヤーから見た評価値 (= -子の手番から見た評価値) が高い順に beam_width 個を残す
+        candidates = [c for c in children if not c.terminal]
+        candidates.sort(key=lambda c: -c.score, reverse=True)
+        frontier = candidates[:beam_width]
+        for child in frontier:
+            # 親の局面から1手進めた局面を作る (親の局面は展開時に破棄済みなので, 根から手順を再生する)
+            path = []
+            node = child
+            while node.parent is not None:
+                path.append(node.move)
+                node = node.parent
+            child.state = state.copy()
+            for move in reversed(path):
+                child.state.play(move)
+        if not frontier:
+            break
 
-    best_move, alpha = None, -math.inf
-    for _, move in scored[:beam_width]:
-        state.play(move)
-        value = -_beam_negamax(state, depth - 1, -math.inf, -alpha, 1, beam_width)
-        state.undo()
-        if best_move is None or value > alpha:
-            best_move, alpha = move, value
-    return best_move, alpha
+    # 根の子を, 1手先の評価値の高い順 (agent_ab.py の手の並べ替えと同じ順) に並べてから最大の手を選ぶ
+    ordered = sorted(root.children, key=lambda c: -c.score, reverse=True)
+    best = max(ordered, key=lambda c: -c.value())
+    return best.move, -best.value()
 
 
 def beam_move(obs: pybl.Observation, depth: int | None = None, num_samples: int | None = None,
@@ -104,7 +117,7 @@ def beam_move(obs: pybl.Observation, depth: int | None = None, num_samples: int 
     obs には手番のプレイヤーの pybl.Observation (GameState.observe で取得) を渡す.
     depth: 山札が残っている間の探索の深さ (1以上. 省略時は DEPTH)
     num_samples: 探索開始時に生成する局面の数 (1以上. 省略時は NUM_SAMPLES)
-    beam_width: 各局面で次の深さに進める手の数 (1以上. 省略時は BEAM_WIDTH)
+    beam_width: 各深さで次の深さに進める (展開する) ノードの数 (1以上. 省略時は BEAM_WIDTH)
     endgame_depth: 山札が無くなった後の探索の深さ (省略時は ENDGAME_DEPTH)
     rng: random.Random を渡すと, 局面の生成にその乱数を使う (再現性が必要な場合に用いる)
 
