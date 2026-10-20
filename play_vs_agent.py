@@ -10,7 +10,7 @@
     python3 play_vs_agent.py abdeck@depth=3     # エージェントの引数を指定する (@引数名=値, 複数はカンマ区切り)
 
 エージェントの指定 (match.py と同じ):
-    random, ab, mon, ismcts, root, dp, abdeck, beam, oracle, ismcts_eval, oracle_eval, azp,
+    random, ab, mon, ismcts, root, dp, abdeck, beam, oracle, ismcts_eval, oracle_eval, azp, az,
     または モジュール名:関数名 (例: agent_ab:alphabeta_move)
     後ろに @引数名=値 を付けると, エージェントの関数に引数を渡せる (例: abdeck@depth=3,num_samples=16)
 

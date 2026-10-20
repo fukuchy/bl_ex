@@ -30,6 +30,7 @@ CPU アフィニティ (使う論理プロセッサの指定):
     ismcts_eval               agent_ismcts_eval.ismcts_eval_move (打ち切り＋静的評価の ISMCTS)
     oracle_eval               agent_ismcts_eval.oracle_eval_move (打ち切り＋静的評価の完全情報 MCTS. 比較用)
     azp                       agent_az.az_policy_move (学習したネットワークの方策だけで手を選ぶ)
+    az                        agent_az.az_move (学習したネットワークを使う ISMCTS)
     モジュール名:関数名        例: agent_ab:alphabeta_move
 
 エージェントの引数の指定 (エージェント名の後ろに @引数名=値 を付ける. 複数ある場合はカンマで区切る):
@@ -71,6 +72,7 @@ AGENTS = {
     "ismcts_eval": ("agent_ismcts_eval", "ismcts_eval_move"),
     "oracle_eval": ("agent_ismcts_eval", "oracle_eval_move"),
     "azp": ("agent_az", "az_policy_move"),
+    "az": ("agent_az", "az_move"),
 }
 
 
@@ -293,8 +295,8 @@ def print_summary(agent1: Agent, agent2: Agent, games: int, total_moves: int, fo
 def main():
     parser = argparse.ArgumentParser(description="エージェント同士を指定回数対戦させる")
     parser.add_argument("games", type=int, help="試合数")
-    parser.add_argument("agent1", help="エージェント1 (random, ab, mon, ismcts, root, dp, abdeck, beam, oracle, ismcts_eval, oracle_eval, azp, または モジュール名:関数名. @引数名=値 で引数を指定)")
-    parser.add_argument("agent2", help="エージェント2 (random, ab, mon, ismcts, root, dp, abdeck, beam, oracle, ismcts_eval, oracle_eval, azp, または モジュール名:関数名. @引数名=値 で引数を指定)")
+    parser.add_argument("agent1", help="エージェント1 (random, ab, mon, ismcts, root, dp, abdeck, beam, oracle, ismcts_eval, oracle_eval, azp, az, または モジュール名:関数名. @引数名=値 で引数を指定)")
+    parser.add_argument("agent2", help="エージェント2 (random, ab, mon, ismcts, root, dp, abdeck, beam, oracle, ismcts_eval, oracle_eval, azp, az, または モジュール名:関数名. @引数名=値 で引数を指定)")
     parser.add_argument("--first", choices=["1", "2", "alt"], default="alt",
                         help="先手: 1 = エージェント1, 2 = エージェント2, alt = 交互 (既定, 1試合目はエージェント1が先手)")
     parser.add_argument("--seed", type=int, default=None, help="乱数シード (指定すると同じ対局を再現できる)")
