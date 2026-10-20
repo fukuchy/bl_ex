@@ -17,8 +17,6 @@
 いずれも bl_ex のディレクトリで実行する (教師のエージェントを match.py と同じ方法で読み込むため).
 """
 import argparse
-import glob
-import math
 import os
 import random
 import sys
@@ -30,6 +28,7 @@ import numpy as np
 
 import pybl
 from az import features as F
+from az.train import concat
 
 ROOT = Path(__file__).resolve().parent.parent      # bl_ex のディレクトリ
 
@@ -88,10 +87,6 @@ def play_teacher_game(task: tuple) -> dict:
     }
 
 
-def _concat(parts: list) -> dict:
-    return {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
-
-
 def generate(args) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -119,7 +114,7 @@ def generate(args) -> None:
             total += len(record["actions"])
             if len(buffer) >= args.save_every or done == args.games:
                 path = out / f"part_{part:04d}.npz"
-                np.savez_compressed(path, **_concat(buffer))
+                np.savez_compressed(path, **concat(buffer))
                 buffer, part = [], part + 1
                 elapsed = time.perf_counter() - start
                 print(f"  {done}/{args.games} 局 ({total} 局面) を保存 [経過 {elapsed:.0f} 秒, "
@@ -133,114 +128,21 @@ def generate(args) -> None:
 # 学習
 # ---------------------------------------------------------------------------
 
-def load_dataset(directories: list) -> dict:
-    files = sorted(f for d in directories for f in glob.glob(os.path.join(d, "*.npz")))
-    if not files:
-        raise SystemExit(f"棋譜が見つかりません: {', '.join(directories)}")
-    parts = []
-    offset = 0
-    for path in files:
-        with np.load(path) as data:
-            part = {k: data[k] for k in data.files}
-        part["games"] = part["games"] + offset         # 複数のディレクトリで局の番号が重ならないようにする
-        offset = int(part["games"].max()) + 1
-        parts.append(part)
-    return _concat(parts)
-
-
 def train(args) -> None:
-    import torch
-    from az.model import SymmetryAugmenter, build_model, default_device, loss_fn, masked_log_softmax, save_checkpoint
+    from az.model import build_model
+    from az.train import fit, load_dataset
 
-    device = torch.device(args.device) if args.device else default_device()
-    torch.manual_seed(args.seed)
-    data = load_dataset(args.data)
-    n = len(data["actions"])
-
-    # 局単位で学習用と検証用に分ける (同じ局の局面が両方に入らないようにする)
-    games = np.unique(data["games"])
-    rng = np.random.default_rng(args.seed)
-    val_games = set(rng.choice(games, size=max(1, int(len(games) * args.val_ratio)), replace=False).tolist())
-    is_val = np.array([g in val_games for g in data["games"]])
-    print(f"局面数 {n} (学習 {int((~is_val).sum())}, 検証 {int(is_val.sum())}), 局数 {len(games)}, 装置 {device}",
-          flush=True)
-
-    def to_device(idx):
-        return {
-            "planes": torch.as_tensor(data["planes"][idx], device=device),            # uint8 のまま置く
-            "scalars": torch.as_tensor(data["scalars"][idx], device=device),
-            "masks": torch.as_tensor(data["masks"][idx], device=device),
-            "actions": torch.as_tensor(data["actions"][idx].astype(np.int64), device=device),
-            "values": torch.as_tensor(data["values"][idx], device=device),
-        }
-
-    train_set, val_set = to_device(np.flatnonzero(~is_val)), to_device(np.flatnonzero(is_val))
     if args.arch == "token":
         config = {"arch": "token", "d_model": args.d_model, "layers": args.layers, "heads": args.heads}
     else:
         config = {"arch": "mlp", "hidden": args.hidden, "blocks": args.blocks}
-    model = build_model(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    steps_per_epoch = math.ceil(len(train_set["actions"]) / args.batch_size)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, total_steps=args.epochs * steps_per_epoch)
-    augment = SymmetryAugmenter(device) if not args.no_augment else None
+    model = build_model(config)
     print(f"ネットワーク: {model.config}, パラメータ数 {sum(p.numel() for p in model.parameters()):,}, "
           f"価値の損失の重み {args.value_weight}", flush=True)
-
-    def batch_tensors(subset, idx):
-        planes = subset["planes"][idx].float()
-        scalars = subset["scalars"][idx]
-        masks = subset["masks"][idx]
-        policy = torch.zeros(len(idx), F.NUM_ACTIONS, device=device)
-        policy.scatter_(1, subset["actions"][idx][:, None], 1.0)
-        return planes, scalars, policy, masks, subset["values"][idx]
-
-    @torch.no_grad()
-    def evaluate(subset):
-        model.eval()
-        total = {"loss": 0.0, "value": 0.0, "policy": 0.0, "acc": 0.0}
-        count = len(subset["actions"])
-        for start in range(0, count, 4096):
-            idx = torch.arange(start, min(start + 4096, count), device=device)
-            planes, scalars, policy, masks, values = batch_tensors(subset, idx)
-            logits, value = model(planes, scalars)
-            loss, vl, pl = loss_fn(logits, value, policy, values, masks, args.value_weight)
-            k = len(idx)
-            total["loss"] += loss.item() * k
-            total["value"] += vl.item() * k
-            total["policy"] += pl.item() * k
-            total["acc"] += (masked_log_softmax(logits, masks).argmax(1) == subset["actions"][idx]).float().sum().item()
-        model.train()
-        return {key: v / count for key, v in total.items()}
-
-    best = math.inf
-    start_time = time.perf_counter()
-    for epoch in range(1, args.epochs + 1):
-        perm = torch.randperm(len(train_set["actions"]), device=device)
-        running = 0.0
-        for step in range(steps_per_epoch):
-            idx = perm[step * args.batch_size:(step + 1) * args.batch_size]
-            planes, scalars, policy, masks, values = batch_tensors(train_set, idx)
-            if augment:
-                planes, scalars, policy, masks = augment(planes, scalars, policy, masks)
-            logits, value = model(planes, scalars)
-            loss, _, _ = loss_fn(logits, value, policy, values, masks, args.value_weight)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            running += loss.item()
-
-        val = evaluate(val_set)
-        mark = ""
-        if val["loss"] < best:
-            best = val["loss"]
-            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-            save_checkpoint(args.out, model, epoch=epoch, val=val, data=args.data, kind="pretrain")
-            mark = "  (保存)"
-        print(f"epoch {epoch:3d}  学習の損失 {running / steps_per_epoch:.4f}  |  検証: 損失 {val['loss']:.4f} "
-              f"(価値 {val['value']:.4f}, 方策 {val['policy']:.4f}), 教師の手との一致率 {val['acc'] * 100:.1f}%"
-              f"  [{time.perf_counter() - start_time:.0f} 秒]{mark}", flush=True)
+    fit(model, load_dataset(args.data), out=args.out, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+        weight_decay=args.weight_decay, value_weight=args.value_weight, augment=not args.no_augment,
+        val_ratio=args.val_ratio, device=args.device, seed=args.seed, keep_best=True,
+        log=lambda text: print(text, flush=True), kind="pretrain", data=args.data)
     print(f"検証の損失が最も小さかったネットワークを {args.out} に保存しました")
 
 
