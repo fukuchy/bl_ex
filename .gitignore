@@ -11,3 +11,8 @@ venv/
 # エディタ
 .vscode/
 .idea/
+
+# AlphaZero 型の学習で生成されるファイル
+data/
+checkpoints/
+runs/
