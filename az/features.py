@@ -183,3 +183,21 @@ def random_symmetry(rng) -> Symmetry:
     rng.shuffle(perm)
     mirror = bool(rng.random() < 0.5)
     return Symmetry(perm, mirror)
+
+
+def symmetry_tables() -> dict:
+    """全ての対称変換の逆写像の表 (学習中に GPU 上でまとめて変換するために使う).
+
+    返り値の各配列は (1440, 長さ) で, 変換後の配列は new[..., j] = old[..., table[s, j]] で求められる.
+        "channel": (1440, NUM_PLANES)   planes のチャンネル
+        "card":    (1440, NUM_CARDS)    planes のカード (色 * 10 + 数字 - 1)
+        "scalar":  (1440, NUM_SCALARS)  scalars
+        "action":  (1440, NUM_ACTIONS)  方策と合法手のマスク
+    """
+    syms = all_symmetries()
+    return {
+        "channel": np.stack([s._channel_inv for s in syms]),
+        "card": np.stack([s._card_inv for s in syms]),
+        "scalar": np.stack([s._scalar_inv for s in syms]),
+        "action": np.stack([s._action_inv for s in syms]),
+    }
