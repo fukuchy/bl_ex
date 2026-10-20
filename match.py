@@ -10,6 +10,12 @@
     python3 match.py 100 ab ab --seed 0           # 同じ対局を再現できるようにする
     python3 match.py 100 ab dp -j 4               # 4試合ずつ並列に対戦させる (-j 0 で CPU のコア数)
     python3 match.py 100 ab dp --interval 10      # 10試合ごとに途中経過 (通算成績) を表示する
+    python3 match.py 100 ab dp -j 8 --affinity 5555   # 論理プロセッサ 0,2,4,...,14 だけで実行する
+
+CPU アフィニティ (使う論理プロセッサの指定):
+    環境変数 BL_AFFINITY に16進数のマスクを設定しておくと, 毎回自動で適用される (--affinity で上書き,
+    --affinity none で無効). 並列実行の子プロセスにも引き継がれる. Windows と Linux で有効 (macOS では無視).
+    例: Core i9-12900 で各 P コアの1スレッド目 (論理プロセッサ 0, 2, ..., 14) だけを使う場合は 5555
 
 エージェントの指定:
     random                    agent_random.random_move
@@ -32,6 +38,7 @@
 (pybl.Observation) のみを渡します. 関数が rng 引数を受け取る場合は, 試合ごとに random.Random を渡します.
 """
 import argparse
+import ctypes
 import importlib
 import os
 import inspect
@@ -204,6 +211,41 @@ def run_game(task: GameTask) -> GameResult:
     )
 
 
+def apply_cpu_affinity(spec: str | None) -> list | None:
+    """CPU アフィニティ (このプロセスと子プロセスが使う論理プロセッサ) を設定し, 使う論理プロセッサの番号を返す.
+
+    spec は16進数のマスク (例: "5555", "0x5555"). None や "none" なら何もしない.
+    設定できない OS (macOS など) では警告を表示して無視する.
+    """
+    if not spec or spec.strip().lower() == "none":
+        return None
+    try:
+        mask = int(spec.strip(), 16)
+    except ValueError:
+        raise SystemExit(f"CPU アフィニティは16進数のマスクで指定してください: {spec}")
+    if mask <= 0:
+        raise SystemExit(f"CPU アフィニティのマスクは0より大きい値を指定してください: {spec}")
+    cpus = [i for i in range(mask.bit_length()) if mask >> i & 1]
+
+    if sys.platform == "win32":
+        # Windows では子プロセスが親プロセスのアフィニティを引き継ぐため, 並列実行のプロセスにも適用される
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        if not kernel32.SetProcessAffinityMask(kernel32.GetCurrentProcess(), mask):
+            raise SystemExit(f"CPU アフィニティを設定できませんでした (マスク {spec}, エラー {ctypes.get_last_error()}). "
+                             f"この PC に無い論理プロセッサを指定していないか確認してください")
+    elif hasattr(os, "sched_setaffinity"):
+        try:
+            os.sched_setaffinity(0, cpus)
+        except OSError as e:
+            raise SystemExit(f"CPU アフィニティを設定できませんでした (マスク {spec}): {e}")
+    else:
+        print(f"この OS では CPU アフィニティを指定できないため, 指定 ({spec}) を無視します", file=sys.stderr)
+        return None
+    return cpus
+
+
 def rate(wins: int, draws: int, games: int) -> str:
     return f"{(wins + 0.5 * draws) / games * 100:5.1f}%" if games else "   - "
 
@@ -242,7 +284,10 @@ def main():
                              "2以上なら指定した試合数ごとに通算成績を表示する")
     parser.add_argument("--quiet", action="store_true", help="途中経過を表示しない")
     parser.add_argument("-j", "--jobs", type=int, default=1,
-                        help="同時に行う試合数 (並列化数). 既定は1 (並列化しない), 0 で CPU のコア数")
+                        help="同時に行う試合数 (並列化数). 既定は1 (並列化しない), 0 で使える論理プロセッサの数")
+    parser.add_argument("--affinity", default=os.environ.get("BL_AFFINITY"),
+                        help="使う論理プロセッサを16進数のマスクで指定する (例: 5555). "
+                             "省略時は環境変数 BL_AFFINITY の値. none で指定しない")
     args = parser.parse_args()
 
     if args.games <= 0:
@@ -251,7 +296,11 @@ def main():
         parser.error("並列化数は0以上を指定してください")
     if args.interval <= 0:
         parser.error("途中経過を表示する間隔は1以上を指定してください")
-    jobs = min(args.games, args.jobs or os.cpu_count() or 1)
+    # 並列実行のプロセスを作る前に設定する (子プロセスに引き継がれる)
+    cpus = apply_cpu_affinity(args.affinity)
+    if cpus is not None:
+        print(f"CPU アフィニティ: 論理プロセッサ {', '.join(map(str, cpus))} を使用", flush=True)
+    jobs = min(args.games, args.jobs or (len(cpus) if cpus else os.cpu_count()) or 1)
 
     # エージェントのモジュールをこのファイルと同じディレクトリから読み込めるようにする
     # (並列実行のプロセスにも sys.path が引き継がれる)
