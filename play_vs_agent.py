@@ -10,7 +10,7 @@
     python3 play_vs_agent.py abdeck@depth=3     # エージェントの引数を指定する (@引数名=値, 複数はカンマ区切り)
 
 エージェントの指定 (match.py と同じ):
-    random, ab, mon, ismcts, root, dp, abdeck, beam, または モジュール名:関数名 (例: agent_ab:alphabeta_move)
+    random, ab, mon, ismcts, root, dp, abdeck, beam, oracle, または モジュール名:関数名 (例: agent_ab:alphabeta_move)
     後ろに @引数名=値 を付けると, エージェントの関数に引数を渡せる (例: abdeck@depth=3,num_samples=16)
 
 エージェントには公平のため, エージェントから見える情報 (pybl.Observation) のみを渡します.
@@ -76,7 +76,7 @@ def main():
         else:
             print(f"{agent.name} が考えています...", end="", flush=True)
             elapsed = agent.think_time
-            move = agent.choose(obs, agent_rng)
+            move = agent.choose(obs, agent_rng, state)
             elapsed = agent.think_time - elapsed
             print("\r" + " " * 40 + "\r", end="")
             if not state.is_legal(move):
