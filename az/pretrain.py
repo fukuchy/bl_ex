@@ -6,6 +6,9 @@
 
     python -m az.pretrain generate --games 2000 --teacher abdeck -j 8 --out data/pretrain_abdeck
 
+   CPU アフィニティ (使う論理プロセッサ) は match.py と同じく, 環境変数 BL_AFFINITY (または --affinity) で
+   指定できる. 並列実行の子プロセスにも引き継がれる (Windows と Linux で有効, macOS では無視).
+
 2. 学習 (train): 記録した棋譜で, 方策 (教師の手) と価値 (最終的な勝敗) を学習する.
    バッチの各要素にランダムな対称変換 (色の入れ替え・フラッグの左右反転) を施してデータを拡張する.
 
@@ -94,7 +97,15 @@ def generate(args) -> None:
     out.mkdir(parents=True, exist_ok=True)
     master = random.Random(args.seed)
     tasks = [(i, args.teacher, master.getrandbits(64), args.explore) for i in range(args.games)]
-    jobs = max(1, min(args.games, args.jobs or os.cpu_count() or 1))
+
+    # 並列実行のプロセスを作る前に CPU アフィニティを設定する (子プロセスに引き継がれる)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from match import apply_cpu_affinity
+    cpus = apply_cpu_affinity(args.affinity)
+    if cpus is not None:
+        print(f"CPU アフィニティ: 論理プロセッサ {', '.join(map(str, cpus))} を使用", flush=True)
+    jobs = max(1, min(args.games, args.jobs or (len(cpus) if cpus else os.cpu_count()) or 1))
     print(f"教師 {args.teacher} の棋譜を {args.games} 局生成します ({jobs} 並列, explore={args.explore}) → {out}",
           flush=True)
 
@@ -244,7 +255,10 @@ def main():
     g.add_argument("--out", default="data/pretrain_abdeck", help="保存先のディレクトリ")
     g.add_argument("--save-every", type=int, default=200, help="何局ごとにファイルに保存するか")
     g.add_argument("--seed", type=int, default=None, help="乱数シード")
-    g.add_argument("-j", "--jobs", type=int, default=0, help="並列化数 (0 で CPU のコア数)")
+    g.add_argument("-j", "--jobs", type=int, default=0, help="並列化数 (0 で使える論理プロセッサの数)")
+    g.add_argument("--affinity", default=os.environ.get("BL_AFFINITY"),
+                   help="使う論理プロセッサを16進数のマスクで指定する (例: 5555). "
+                        "省略時は環境変数 BL_AFFINITY の値. none で指定しない")
 
     t = sub.add_parser("train", help="棋譜でネットワークを学習する")
     t.add_argument("--data", nargs="+", default=["data/pretrain_abdeck"], help="棋譜のディレクトリ (複数可)")
