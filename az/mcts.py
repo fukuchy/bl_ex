@@ -10,6 +10,8 @@ v1 の ISMCTS (agent_ismcts.py) と同じく, シミュレーションごとに�
 
 選択 (PUCT): 子 a の値 = Q(a) + c_puct × P(a) × √(Σ_b N(b)) / (1 + N(a))
     Q(a): 子 a の平均価値 (その手を指したプレイヤーから見た値, -1〜1). 未訪問なら fpu
+          (fpu_reduction を指定すると, 未訪問の手の Q を 訪問済みの子の平均価値 − fpu_reduction × √(訪問済みの子の P の合計)
+           にする (Leela Zero の FPU reduction). 負けている局面で未訪問の手ばかりが選ばれて探索が広がりすぎるのを防ぐ)
     P(a): ノードを評価したときに保存した方策のロジットを, この determinization で合法な手だけで softmax したもの
     Σ_b N(b): この determinization で合法な手の子の訪問回数の合計 (ISMCTS の availability に当たる)
 
@@ -117,15 +119,17 @@ def _terminal_value(state, player) -> float:
 
 
 def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct: float = 1.5,
-           batch_size: int = 16, fpu: float = 0.0, dirichlet_alpha: float = 0.0, dirichlet_epsilon: float = 0.25,
-           use_representatives: bool = True, rng: random.Random | None = None) -> SearchResult:
+           batch_size: int = 16, fpu: float = 0.0, fpu_reduction: float | None = None, dirichlet_alpha: float = 0.0,
+           dirichlet_epsilon: float = 0.25, use_representatives: bool = True,
+           rng: random.Random | None = None) -> SearchResult:
     """obs (手番のプレイヤーの観測) から ISMCTS で探索し, ルートの統計を返す.
 
     evaluator: (planes, scalars) をまとめて受け取り (方策のロジット, 価値) を返す関数 (NetworkEvaluator など)
     num_simulations: シミュレーションの回数
     c_puct: PUCT の探索係数
     batch_size: まとめてネットワークで評価する葉の数
-    fpu: 未訪問の子の Q の値 (first play urgency)
+    fpu: 未訪問の子の Q の値 (first play urgency). fpu_reduction を指定した場合は使わない
+    fpu_reduction: 指定すると, 未訪問の子の Q を 訪問済みの子の平均価値 − fpu_reduction × √(訪問済みの子の P の合計) にする
     dirichlet_alpha: ルートの事前確率に混ぜるディリクレノイズの集中度 (0 なら混ぜない)
     dirichlet_epsilon: ディリクレノイズを混ぜる割合
     use_representatives: ルートで同等な手を1つの代表にまとめるか
@@ -172,7 +176,7 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
                     inputs.append((planes, scalars))
                     pending.append((node, path, work.side_to_move))
                     break
-                move = _select(node, root, root_moves, root_prior_of, work, c_puct, fpu)
+                move = _select(node, root, root_moves, root_prior_of, work, c_puct, fpu, fpu_reduction)
                 child = node.children.get(move)
                 if child is None:
                     child = Node(move, work.side_to_move, node)
@@ -205,7 +209,8 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
     return SearchResult(root_moves, visits, q_values, policy, root_value)
 
 
-def _select(node: Node, root: Node, root_moves: list, root_prior_of: dict, work, c_puct: float, fpu: float) -> int:
+def _select(node: Node, root: Node, root_moves: list, root_prior_of: dict, work, c_puct: float, fpu: float,
+            fpu_reduction: float | None = None) -> int:
     """PUCT で手を選ぶ"""
     if node is root:
         legal = root_moves
@@ -215,12 +220,17 @@ def _select(node: Node, root: Node, root_moves: list, root_prior_of: dict, work,
         priors = _softmax(node.logits[legal])
         legal = legal.tolist()
     children = node.children
-    total = 0
-    for m in legal:
+    total, value_total, visited_prior = 0, 0.0, 0.0
+    for m, p in zip(legal, priors):
         child = children.get(m)
-        if child is not None:
+        if child is not None and child.visits > 0:
             total += child.visits
+            value_total += child.value_sum
+            visited_prior += p
     sqrt_total = math.sqrt(max(total, 1))
+    if fpu_reduction is not None:
+        # 子の価値はその手を指したプレイヤー (このノードの手番) から見た値なので, その平均を親の価値とする
+        fpu = (value_total / total if total > 0 else 0.0) - fpu_reduction * math.sqrt(visited_prior)
     best, best_score = legal[0], -math.inf
     for m, p in zip(legal, priors):
         child = children.get(m)

@@ -20,6 +20,14 @@ class UniformEvaluator:
         return np.zeros((len(planes), F.NUM_ACTIONS), dtype=np.float32), np.zeros(len(planes), dtype=np.float32)
 
 
+class LosingEvaluator(UniformEvaluator):
+    """方策は一様, 価値は手番のプレイヤーから見て常に +0.5 (ルートの手を指した直後の局面は相手の手番なので, ルートの手の Q は負になる)"""
+
+    def __call__(self, planes, scalars):
+        logits, values = super().__call__(planes, scalars)
+        return logits, values + 0.5
+
+
 def random_position(seed: int, max_moves: int = 30) -> pybl.GameState:
     rng = random.Random(seed)
     while True:
@@ -132,6 +140,28 @@ def test_finds_immediate_win(case):
     assert result.best_move() in winning
 
 
+@pytest.mark.parametrize("seed", range(5))
+def test_fpu_reduction_narrows_search_in_losing_positions(seed):
+    state = random_position(seed, max_moves=10)
+    obs = state.observe(state.side_to_move)
+    kwargs = dict(num_simulations=100, batch_size=1, use_representatives=False)
+    absolute = mcts.search(obs, LosingEvaluator(), rng=random.Random(seed), **kwargs)
+    reduced = mcts.search(obs, LosingEvaluator(), fpu_reduction=0.2, rng=random.Random(seed), **kwargs)
+    # fpu=0 では Q が負の訪問済みの手より未訪問の手が優先され, 合法手の全てを訪問する
+    assert (absolute.visits > 0).sum() == min(len(absolute.moves), 100)
+    assert (reduced.visits > 0).sum() < (absolute.visits > 0).sum()
+    assert reduced.visits.sum() == absolute.visits.sum() == 100
+
+
+def test_fpu_reduction_with_zero_is_parent_value():
+    """fpu_reduction=0 では, 未訪問の手の Q は訪問済みの子の平均価値になる (一様な事前確率で全ての手を訪問しうる)"""
+    state = random_position(3)
+    obs = state.observe(state.side_to_move)
+    result = mcts.search(obs, UniformEvaluator(), num_simulations=60, batch_size=4, fpu_reduction=0.0,
+                         rng=random.Random(0))
+    assert result.visits.sum() == 60
+
+
 def test_az_move_with_checkpoint(tmp_path):
     torch = pytest.importorskip("torch")
     from az.model import TokenNet, save_checkpoint
@@ -143,6 +173,7 @@ def test_az_move_with_checkpoint(tmp_path):
     state = pybl.GameState(seed=1)
     while not state.is_terminal:
         obs = state.observe(state.side_to_move)
-        move = agent_az.az_move(obs, checkpoint=str(path), num_simulations=20, batch_size=4, rng=rng)
+        move = agent_az.az_move(obs, checkpoint=str(path), num_simulations=20, batch_size=4,
+                                fpu_reduction=0.2 if state.move_count % 2 else None, rng=rng)
         assert state.is_legal(move)
         state.play(move)
