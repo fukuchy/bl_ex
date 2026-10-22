@@ -16,3 +16,9 @@ venv/
 data/
 checkpoints/
 runs/
+
+# Cython の拡張のビルド (python setup.py build_ext --inplace)
+build/
+az/_fast.c
+*.so
+*.pyd

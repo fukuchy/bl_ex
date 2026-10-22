@@ -61,3 +61,49 @@ def test_generate_and_fit(checkpoint, tmp_path):
     assert new.exists() and result["val"] is not None
     loaded, ckpt = load_checkpoint(new)
     assert ckpt["epoch"] == 1
+
+
+class RowEvaluator:
+    """各局面の入力だけから決まる値を返すダミーの評価器 (まとめ方によらず同じ結果になる). 呼び出しの大きさを記録する"""
+
+    def __init__(self):
+        self.batch_sizes = []
+
+    def __call__(self, planes, scalars):
+        self.batch_sizes.append(len(planes))
+        flat = planes.reshape(len(planes), -1).astype(np.float32)
+        logits = flat[:, :F.NUM_ACTIONS] * 0.5 + flat[:, -F.NUM_ACTIONS:] * 0.25
+        values = np.tanh(scalars.sum(axis=1) * 0.1 - flat.mean(axis=1))
+        return logits, values.astype(np.float32)
+
+
+def test_batched_games_match_sequential_games():
+    config = small_config()
+    tasks = [(i, 100 + i, config) for i in range(6)]
+    sequential = list(selfplay.play_games_batched(tasks, RowEvaluator(), concurrency=1))
+    evaluator = RowEvaluator()
+    batched = list(selfplay.play_games_batched(tasks, evaluator, concurrency=4))
+    assert max(evaluator.batch_sizes) > config["batch_size"]          # 複数の局の葉をまとめて評価している
+    by_game = {int(r["games"][0]): r for r in batched}
+    assert sorted(by_game) == list(range(6))
+    for record in sequential:
+        other = by_game[int(record["games"][0])]
+        assert record.keys() == other.keys()
+        for key in record:
+            assert np.array_equal(record[key], other[key]), key
+
+
+def test_generate_with_processes(checkpoint, tmp_path):
+    out = tmp_path / "data"
+    stats = selfplay.generate(checkpoint, 5, out, small_config(), jobs=2, seed=0, save_every=2, device="cpu",
+                              concurrency=2, log=lambda *_: None)
+    assert stats["games"] == 5 and len(list(out.glob("*.npz"))) == 3
+    data = load_dataset([out])
+    assert len(np.unique(data["games"])) == 5 and len(data["values"]) == stats["positions"]
+
+
+def test_generate_reports_worker_error(tmp_path):
+    broken = tmp_path / "broken.pt"
+    broken.write_bytes(b"not a checkpoint")
+    with pytest.raises(RuntimeError, match="エラー"):
+        selfplay.generate(broken, 2, tmp_path / "data", small_config(), jobs=2, device="cpu", log=lambda *_: None)

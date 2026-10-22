@@ -69,6 +69,10 @@ def main():
     parser.add_argument("-j", "--jobs", type=int, default=0, help="自己対戦と対戦の並列化数")
     parser.add_argument("--affinity", default=os.environ.get("BL_AFFINITY"))
     parser.add_argument("--device", default=None, help="学習に使う装置 (cuda / cpu)")
+    parser.add_argument("--selfplay-device", default=None,
+                        help="自己対戦の推論に使う装置 (cuda / cpu, 省略時は GPU があれば cuda)")
+    parser.add_argument("--concurrency", type=int, default=0,
+                        help="自己対戦の1プロセスで同時に進める局の数 (0 なら cuda で 32, cpu で 1)")
     for key, value in selfplay.DEFAULT_CONFIG.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=type(value), default=value, help="自己対戦の設定")
     args = parser.parse_args()
@@ -118,6 +122,7 @@ def main():
         if data_dir(gen).exists():
             shutil.rmtree(data_dir(gen))
         stats = selfplay.generate(checkpoint(best), args.games, data_dir(gen), config, jobs=jobs, affinity=None,
+                                  device=args.selfplay_device, concurrency=args.concurrency,
                                   log=lambda text: _log(run, text))
         row.update(selfplay_games=stats["games"], positions=stats["positions"], selfplay_seconds=round(stats["seconds"]))
 

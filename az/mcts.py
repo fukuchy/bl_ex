@@ -16,6 +16,7 @@ v1 の ISMCTS (agent_ismcts.py) と同じく, シミュレーションごとに�
     Σ_b N(b): この determinization で合法な手の子の訪問回数の合計 (ISMCTS の availability に当たる)
 
 バッチ推論: batch_size 個のシミュレーションを先に進め, 葉をまとめてネットワークで評価する.
+    search_steps は評価をジェネレータの外に任せるので, 複数の探索 (自己対戦の複数の局) の葉をまとめて GPU で評価できる.
     同じ葉にシミュレーションが集中しないよう, 評価を待つ間は仮想損失 (N を 1 増やし, 負けとして数える) を加える.
 
 ルート:
@@ -33,7 +34,7 @@ import pybl
 from az import features as F
 
 
-class Node:
+class _PyNode:
     __slots__ = ("move", "player", "parent", "children", "visits", "value_sum", "logits")
 
     def __init__(self, move, player, parent):
@@ -46,19 +47,27 @@ class Node:
         self.logits = None          # ネットワークで評価したときの方策のロジット (541,). 未評価なら None
 
 
+try:
+    from az._fast import Node      # Cython 版 (python setup.py build_ext --inplace でビルドする)
+except ImportError:
+    Node = _PyNode
+
+
 class NetworkEvaluator:
     """ネットワークで局面をまとめて評価する: (planes, scalars) → (方策のロジット (B, 541), 価値 (B,))"""
 
-    def __init__(self, model, device="cpu"):
+    def __init__(self, model, device="cpu", half: bool | None = None):
+        """half: 半精度 (float16) で推論するか. 省略時は GPU (cuda) なら半精度にする"""
         import torch
         self.torch = torch
         self.model = model.to(device).eval()
-        self.device = device
+        self.device = torch.device(device)
+        self.half = self.device.type == "cuda" if half is None else half
 
     def __call__(self, planes: np.ndarray, scalars: np.ndarray) -> tuple:
         torch = self.torch
-        with torch.no_grad():
-            p = torch.as_tensor(planes, dtype=torch.float32, device=self.device)
+        with torch.no_grad(), torch.autocast(self.device.type, dtype=torch.float16, enabled=self.half):
+            p = torch.as_tensor(planes, device=self.device).float()     # uint8 のまま転送してから変換する
             s = torch.as_tensor(scalars, dtype=torch.float32, device=self.device)
             logits, value = self.model(p, s)
         return logits.float().cpu().numpy(), value.float().cpu().numpy()
@@ -105,6 +114,9 @@ def _equivalence_classes(obs: pybl.Observation, use_representatives: bool) -> di
     return classes
 
 
+_PASS = int(pybl.PASS_MOVE)
+
+
 def _softmax(x: np.ndarray) -> np.ndarray:
     e = np.exp(x - x.max())
     return e / e.sum()
@@ -118,6 +130,16 @@ def _terminal_value(state, player) -> float:
     return 1.0 if winner == player else -1.0
 
 
+def run_steps(steps, evaluator):
+    """評価の要求を出すジェネレータ (search_steps など) を, evaluator で評価しながら最後まで進めて, その戻り値を返す"""
+    try:
+        request = next(steps)
+        while True:
+            request = steps.send(evaluator(*request))
+    except StopIteration as stop:
+        return stop.value
+
+
 def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct: float = 1.5,
            batch_size: int = 16, fpu: float = 0.0, fpu_reduction: float | None = None, dirichlet_alpha: float = 0.0,
            dirichlet_epsilon: float = 0.25, use_representatives: bool = True,
@@ -125,6 +147,23 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
     """obs (手番のプレイヤーの観測) から ISMCTS で探索し, ルートの統計を返す.
 
     evaluator: (planes, scalars) をまとめて受け取り (方策のロジット, 価値) を返す関数 (NetworkEvaluator など)
+    その他の引数は search_steps と同じ
+    """
+    return run_steps(search_steps(obs, num_simulations=num_simulations, c_puct=c_puct, batch_size=batch_size, fpu=fpu,
+                                  fpu_reduction=fpu_reduction, dirichlet_alpha=dirichlet_alpha,
+                                  dirichlet_epsilon=dirichlet_epsilon, use_representatives=use_representatives,
+                                  rng=rng), evaluator)
+
+
+def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: float = 1.5, batch_size: int = 16,
+                 fpu: float = 0.0, fpu_reduction: float | None = None, dirichlet_alpha: float = 0.0,
+                 dirichlet_epsilon: float = 0.25, use_representatives: bool = True,
+                 rng: random.Random | None = None):
+    """search と同じ探索を, ネットワークの評価を外に任せるジェネレータとして行う.
+
+    評価してほしい局面を (planes (B, ...), scalars (B, ...)) として yield し, (方策のロジット (B, 541), 価値 (B,)) を
+    send で受け取る. 終わると SearchResult を返す (StopIteration.value). 複数の探索の要求をまとめて評価するのに使う.
+
     num_simulations: シミュレーションの回数
     c_puct: PUCT の探索係数
     batch_size: まとめてネットワークで評価する葉の数
@@ -143,17 +182,18 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
 
     # ルートの事前確率 (代表の手には, 同等な手の確率の合計を割り当てる)
     planes, scalars = F.encode(obs)
-    logits, values = evaluator(planes[None], scalars[None])
+    logits, values = yield planes[None], scalars[None]
     legal = obs.get_legal_moves()
     probs = dict(zip(legal.tolist(), _softmax(logits[0][legal])))
     root_prior = np.array([sum(probs[m] for m in classes[r]) for r in root_moves])
     if dirichlet_alpha > 0 and len(root_moves) > 1:
         noise = np.random.default_rng(rng.getrandbits(64)).dirichlet([dirichlet_alpha] * len(root_moves))
         root_prior = (1 - dirichlet_epsilon) * root_prior + dirichlet_epsilon * noise
-    root_prior_of = dict(zip(root_moves, root_prior))
+    root_priors = np.ascontiguousarray(root_prior, dtype=np.float64)
     root_value = float(values[0])
 
     base = obs.sample_state(seed=rng.getrandbits(64))
+    root_masks = F.flag_card_masks(obs)      # フラッグに置かれたカード (determinization で変わらない)
     done = 0
     while done < num_simulations:
         pending = []        # (葉のノード, 経路, 葉の局面の手番のプレイヤー)
@@ -163,6 +203,7 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
             work = base.copy()
             work.determinize(me, seed=rng.getrandbits(64))
             node, path = root, []
+            masks = list(root_masks)
             while True:
                 if work.is_terminal:
                     _backup(path, lambda p, s=work: _terminal_value(s, p), virtual=True)
@@ -172,26 +213,29 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
                         _backup(path, lambda p: 0.0, virtual=True)
                         break
                     o = work.observe(work.side_to_move)
-                    planes, scalars = F.encode(o)
+                    planes, scalars = F.encode(o, masks)
                     inputs.append((planes, scalars))
                     pending.append((node, path, work.side_to_move))
                     break
-                move = _select(node, root, root_moves, root_prior_of, work, c_puct, fpu, fpu_reduction)
+                move = _select(node, root, root_moves, root_priors, work, c_puct, fpu, fpu_reduction)
+                mover = work.side_to_move
                 child = node.children.get(move)
                 if child is None:
-                    child = Node(move, work.side_to_move, node)
+                    child = Node(move, mover, node)
                     node.children[move] = child
                 work.play(move)
+                if move != _PASS:
+                    masks[int(mover) * F.NUM_FLAGS + move % F.NUM_FLAGS] |= 1 << (move // F.NUM_FLAGS)
                 node = child
                 path.append(node)
                 node.visits += 1            # 仮想損失: 評価を待つ間は負けとして数える
                 node.value_sum -= 1.0
 
         if pending:
-            logits, values = evaluator(np.stack([x[0] for x in inputs]), np.stack([x[1] for x in inputs]))
+            logits, values = yield np.stack([x[0] for x in inputs]), np.stack([x[1] for x in inputs])
             for (node, path, to_move), node_logits, value in zip(pending, logits, values):
                 if node.logits is None:
-                    node.logits = node_logits
+                    node.logits = np.ascontiguousarray(node_logits, dtype=np.float32)
                 v = float(value)
                 _backup(path, lambda p, v=v, t=to_move: v if p == t else -v, virtual=True)
 
@@ -209,15 +253,15 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
     return SearchResult(root_moves, visits, q_values, policy, root_value)
 
 
-def _select(node: Node, root: Node, root_moves: list, root_prior_of: dict, work, c_puct: float, fpu: float,
-            fpu_reduction: float | None = None) -> int:
-    """PUCT で手を選ぶ"""
+def _select_py(node, root, root_moves: list, root_priors: np.ndarray, work, c_puct: float, fpu: float,
+               fpu_reduction: float | None = None) -> int:
+    """PUCT で手を選ぶ (root_priors は root_moves の順のルートの事前確率). Cython 版 (_fast.select) と同じ計算をする"""
     if node is root:
         legal = root_moves
-        priors = [root_prior_of[m] for m in legal]
+        priors = root_priors
     else:
         legal = work.get_legal_moves()
-        priors = _softmax(node.logits[legal])
+        priors = _softmax(node.logits[legal].astype(np.float64))
         legal = legal.tolist()
     children = node.children
     total, value_total, visited_prior = 0, 0.0, 0.0
@@ -249,3 +293,9 @@ def _backup(path: list, value_for, virtual: bool) -> None:
         if virtual:
             node.value_sum += 1.0       # 仮想損失 (-1) を取り除く (訪問回数はそのまま1回として数える)
         node.value_sum += value_for(node.player)
+
+
+try:
+    from az._fast import select as _select
+except ImportError:
+    _select = _select_py

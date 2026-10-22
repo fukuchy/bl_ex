@@ -68,20 +68,33 @@ def _cards(bits) -> list:
     return [int(c) for c in pybl.CardIterator(bits)]
 
 
-def encode(obs: pybl.Observation) -> tuple:
-    """観測を (planes, scalars) に変換する. planes は (NUM_PLANES, 6, 10), scalars は (NUM_SCALARS,) の float32"""
+def flag_card_masks(obs) -> list:
+    """各フラッグに置かれたカードのビットマスクのリスト. 要素 [プレイヤー × 9 + フラッグ] (プレイヤーは先手 0, 後手 1).
+
+    フラッグのカードは determinization で変わらないので, 探索ではルートで1回求めて, 手を指すたびに更新して encode に渡す.
+    """
+    masks = [0] * (2 * NUM_FLAGS)
+    for player in (pybl.FIRST, pybl.SECOND):
+        for i in range(NUM_FLAGS):
+            for c in obs.get_flag_cards(i, player):
+                masks[int(player) * NUM_FLAGS + i] |= 1 << int(c)
+    return masks
+
+
+def _encode_py(obs: pybl.Observation, flag_masks: list | None = None) -> tuple:
+    """encode の Python 版"""
     me = obs.player
     opp = pybl.to_opponent(me)
     planes = np.zeros((NUM_PLANES, NUM_CARDS), dtype=np.float32)
     planes[PLANE_HAND, _cards(obs.hand)] = 1.0
     planes[PLANE_UNSEEN, _cards(obs.unseen_cards)] = 1.0
 
+    if flag_masks is None:
+        flag_masks = flag_card_masks(obs)
     scalars = np.zeros(NUM_SCALARS, dtype=np.float32)
     for i in range(NUM_FLAGS):
-        for c in obs.get_flag_cards(i, me):
-            planes[PLANE_MY_FLAG + i, int(c)] = 1.0
-        for c in obs.get_flag_cards(i, opp):
-            planes[PLANE_OPP_FLAG + i, int(c)] = 1.0
+        planes[PLANE_MY_FLAG + i, _cards(flag_masks[int(me) * NUM_FLAGS + i])] = 1.0
+        planes[PLANE_OPP_FLAG + i, _cards(flag_masks[int(opp) * NUM_FLAGS + i])] = 1.0
         owner = obs.get_flag_owner(i)
         completer = obs.get_flag_first_completer(i)
         scalars[SCALAR_MY_CLAIMED + i] = owner == me
@@ -95,6 +108,25 @@ def encode(obs: pybl.Observation) -> tuple:
     scalars[SCALAR_PASSED] = obs.consecutive_pass_count > 0
     scalars[SCALAR_FIRST_PLAYER] = me == obs.first_player
     return planes.reshape(NUM_PLANES, *PLANE_SHAPE), scalars
+
+
+try:
+    from az import _fast
+except ImportError:         # Cython 版をビルドしていない (python setup.py build_ext --inplace)
+    _fast = None
+else:
+    assert all(_fast.CONSTANTS[name] == globals()[name] for name in _fast.CONSTANTS)
+    assert pybl.HAND_SIZE == 7 and _INITIAL_DECK == 46 and int(pybl.FIRST) == 0 and int(pybl.SECOND) == 1
+
+
+def encode(obs: pybl.Observation, flag_masks: list | None = None) -> tuple:
+    """観測を (planes, scalars) に変換する. planes は (NUM_PLANES, 6, 10), scalars は (NUM_SCALARS,) の float32.
+
+    flag_masks: flag_card_masks(obs) と同じもの (探索で渡すと, フラッグのカードを obs から取り出す時間を省ける)
+    """
+    if _fast is not None:
+        return _fast.encode(obs, flag_masks)
+    return _encode_py(obs, flag_masks)
 
 
 def legal_mask(obs: pybl.Observation) -> np.ndarray:
