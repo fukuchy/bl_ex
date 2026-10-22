@@ -177,3 +177,23 @@ def test_az_move_with_checkpoint(tmp_path):
                                 fpu_reduction=0.2 if state.move_count % 2 else None, rng=rng)
         assert state.is_legal(move)
         state.play(move)
+
+
+@pytest.mark.parametrize("device", ["cpu", "auto", "mps", "cuda"])
+def test_az_agents_on_device(tmp_path, device):
+    torch = pytest.importorskip("torch")
+    if device == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("MPS が無い")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA が無い")
+    from az.model import TokenNet, save_checkpoint
+    import agent_az
+    path = tmp_path / "net.pt"
+    torch.manual_seed(0)
+    save_checkpoint(path, TokenNet(d_model=32, layers=1, heads=2))
+    rng = random.Random(0)
+    state = random_position(2)
+    obs = state.observe(state.side_to_move)
+    assert state.is_legal(agent_az.az_move(obs, checkpoint=str(path), num_simulations=20, batch_size=4,
+                                           device=device, rng=rng))
+    assert state.is_legal(agent_az.az_policy_move(obs, checkpoint=str(path), device=device))

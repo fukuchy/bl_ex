@@ -34,8 +34,8 @@ def _log(run: Path, text: str) -> None:
         f.write(line + "\n")
 
 
-def _az_spec(checkpoint: Path, simulations: int) -> str:
-    return f"az@checkpoint={checkpoint},num_simulations={simulations}"
+def _az_spec(checkpoint: Path, simulations: int, device: str = "cpu") -> str:
+    return f"az@checkpoint={checkpoint},num_simulations={simulations},device={device}"
 
 
 def _append_csv(path: Path, row: dict) -> None:
@@ -71,6 +71,8 @@ def main():
     parser.add_argument("--device", default=None, help="学習に使う装置 (cuda / cpu)")
     parser.add_argument("--selfplay-device", default=None,
                         help="自己対戦の推論に使う装置 (cuda / cpu, 省略時は GPU があれば cuda)")
+    parser.add_argument("--eval-device", default="cpu",
+                        help="ゲーティングと評価の対戦で az の推論に使う装置 (cpu / cuda / auto)")
     parser.add_argument("--concurrency", type=int, default=0,
                         help="自己対戦の1プロセスで同時に進める局の数 (0 なら cuda で 32, cpu で 1)")
     for key, value in selfplay.DEFAULT_CONFIG.items():
@@ -142,7 +144,8 @@ def main():
 
         # 3. ゲーティング
         if args.gate_threshold > 0:
-            result = evaluate(_az_spec(checkpoint(gen), eval_sims), _az_spec(checkpoint(best), eval_sims),
+            result = evaluate(_az_spec(checkpoint(gen), eval_sims, args.eval_device),
+                              _az_spec(checkpoint(best), eval_sims, args.eval_device),
                               args.gate_games, jobs=jobs, seed=gen)
             accepted = result["rate"] >= args.gate_threshold
             _log(run, f"ゲーティング 世代 {gen} 対 世代 {best}: {format_result(result)} → "
@@ -159,8 +162,8 @@ def main():
         for agent in args.eval_agents:
             key = f"vs_{agent.split('@')[0]}"
             if args.eval_every > 0 and gen % args.eval_every == 0:
-                result = evaluate(_az_spec(checkpoint(state["best"]), eval_sims), agent, args.eval_games,
-                                  jobs=jobs, seed=10_000 + gen)
+                result = evaluate(_az_spec(checkpoint(state["best"]), eval_sims, args.eval_device), agent,
+                                  args.eval_games, jobs=jobs, seed=10_000 + gen)
                 _log(run, f"評価 世代 {state['best']} 対 {agent}: {format_result(result)}")
                 row[key] = round(result["rate"], 4)
             else:
