@@ -22,3 +22,6 @@ build/
 az/_fast.c
 *.so
 *.pyd
+
+# グラフ (pic/plot_log.py) と画像
+pic/
