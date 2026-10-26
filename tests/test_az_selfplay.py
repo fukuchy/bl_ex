@@ -107,3 +107,34 @@ def test_generate_reports_worker_error(tmp_path):
     broken.write_bytes(b"not a checkpoint")
     with pytest.raises(RuntimeError, match="エラー"):
         selfplay.generate(broken, 2, tmp_path / "data", small_config(), jobs=2, device="cpu", log=lambda *_: None)
+
+
+def test_fpu_reduction_in_config(monkeypatch):
+    import argparse
+    from az import mcts
+    seen = []
+    original = mcts.search_steps
+
+    def recording(obs, **kwargs):
+        seen.append(kwargs["fpu_reduction"])
+        return original(obs, **kwargs)
+
+    monkeypatch.setattr(mcts, "search_steps", recording)
+    config = {**small_config(), "fpu_reduction": 0.2}
+    list(selfplay.play_games_batched([(0, 1, config)], RowEvaluator(), concurrency=1))
+    assert seen and set(seen) == {0.2}
+
+    parser = argparse.ArgumentParser()
+    selfplay.add_config_arguments(parser)
+    assert parser.parse_args([]).fpu_reduction is None
+    assert parser.parse_args(["--fpu-reduction", "0.2"]).fpu_reduction == 0.2
+
+
+def test_loop_az_spec_uses_selfplay_search_settings():
+    import match
+    from az.loop import _az_spec
+    config = {**selfplay.DEFAULT_CONFIG, "c_puct": 1.0}
+    assert "fpu_reduction" not in _az_spec("net.pt", config, 200)
+    kwargs = match.load_agent(_az_spec("net.pt", {**config, "fpu_reduction": 0.2}, 100, "cuda")).kwargs
+    assert kwargs == {"checkpoint": "net.pt", "num_simulations": 100, "c_puct": 1.0, "batch_size": 16, "fpu": 0.0,
+                      "device": "cuda", "fpu_reduction": 0.2}

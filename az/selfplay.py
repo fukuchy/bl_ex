@@ -38,10 +38,29 @@ DEFAULT_CONFIG = {
     "c_puct": 1.5,
     "batch_size": 16,
     "fpu": 0.0,
+    "fpu_reduction": None,          # 指定すると未訪問の手の Q を 親の価値 − fpu_reduction × √(訪問済みの P) にする (fpu は使わない)
     "dirichlet_alpha": 0.3,
     "dirichlet_epsilon": 0.25,
     "temperature_moves": 16,
 }
+
+CONFIG_HELP = {
+    "num_simulations": "1手あたりのシミュレーションの回数",
+    "c_puct": "PUCT の探索係数",
+    "batch_size": "1局の探索でまとめて評価する葉の数",
+    "fpu": "未訪問の手の Q の値",
+    "fpu_reduction": "FPU reduction (例: 0.2). 省略時は使わず, fpu を使う",
+    "dirichlet_alpha": "ルートに混ぜるディリクレノイズの集中度",
+    "dirichlet_epsilon": "ディリクレノイズを混ぜる割合",
+    "temperature_moves": "訪問回数に比例した確率で手を選ぶ手数",
+}
+
+
+def add_config_arguments(parser) -> None:
+    """自己対戦の設定 (DEFAULT_CONFIG) のコマンドライン引数を加える"""
+    for key, value in DEFAULT_CONFIG.items():
+        parser.add_argument(f"--{key.replace('_', '-')}", type=float if value is None else type(value), default=value,
+                            help=f"自己対戦の設定: {CONFIG_HELP[key]}")
 
 def default_device() -> str:
     import torch
@@ -74,7 +93,8 @@ def selfplay_game_steps(game_index: int, seed: int, config: dict):
             continue
         result = yield from mcts.search_steps(
             obs, num_simulations=config["num_simulations"], c_puct=config["c_puct"],
-            batch_size=config["batch_size"], fpu=config["fpu"], dirichlet_alpha=config["dirichlet_alpha"],
+            batch_size=config["batch_size"], fpu=config["fpu"], fpu_reduction=config.get("fpu_reduction"),
+            dirichlet_alpha=config["dirichlet_alpha"],
             dirichlet_epsilon=config["dirichlet_epsilon"], rng=rng)
         p, s = F.encode(obs)
         planes.append(p.astype(np.uint8))
@@ -212,7 +232,8 @@ def generate(checkpoint, games: int, out, config: dict | None = None, jobs: int 
     cpus = apply_cpu_affinity(affinity)
     jobs = max(1, min(games, jobs or (len(cpus) if cpus else os.cpu_count()) or 1))
     log(f"自己対戦 {games} 局 ({jobs} プロセス × 同時 {concurrency} 局, 推論 {device}, "
-        f"{config['num_simulations']} シミュレーション/手) → {out}")
+        f"{config['num_simulations']} シミュレーション/手, c_puct {config['c_puct']}, "
+        f"fpu_reduction {config['fpu_reduction']}) → {out}")
     if F._fast is None:
         log("  (Cython 版が無いので Python 版で探索する. python setup.py build_ext --inplace でビルドすると速くなる)")
 
@@ -242,8 +263,7 @@ def main():
     parser.add_argument("--device", default=None, help="推論に使う装置 (cuda / cpu, 省略時は GPU があれば cuda)")
     parser.add_argument("--concurrency", type=int, default=0,
                         help="1プロセスで同時に進める局の数 (0 なら cuda で 32, cpu で 1)")
-    for key, value in DEFAULT_CONFIG.items():
-        parser.add_argument(f"--{key.replace('_', '-')}", type=type(value), default=value)
+    add_config_arguments(parser)
     args = parser.parse_args()
     config = {key: getattr(args, key) for key in DEFAULT_CONFIG}
     generate(args.checkpoint, args.games, args.out, config, jobs=args.jobs, seed=args.seed, affinity=args.affinity,
