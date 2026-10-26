@@ -6,6 +6,7 @@
     3. ゲーティング: 新しいネットワークと best を gate_games 試合対戦させ, 勝率が gate_threshold 以上なら best を更新する
        (gate_threshold が 0 なら対戦せずに常に更新する)
     4. 既存のエージェントとの比較: eval_every 世代ごとに, best を eval_agents と対戦させる
+    ゲーティングと比較の対戦の az は, 自己対戦と同じ探索の設定 (c_puct, batch_size, fpu) を使う
 
     python -m az.loop --run runs/az1 --init checkpoints/pretrain.pt --iterations 20 --games 500
 
@@ -34,8 +35,10 @@ def _log(run: Path, text: str) -> None:
         f.write(line + "\n")
 
 
-def _az_spec(checkpoint: Path, simulations: int, device: str = "cpu") -> str:
-    return f"az@checkpoint={checkpoint},num_simulations={simulations},device={device}"
+def _az_spec(checkpoint: Path, config: dict, simulations: int, device: str = "cpu") -> str:
+    """対戦に使う az の指定. 探索の設定 (c_puct, batch_size, fpu) は自己対戦と同じにする (ノイズと温度は使わない)"""
+    return (f"az@checkpoint={checkpoint},num_simulations={simulations},c_puct={config['c_puct']},"
+            f"batch_size={config['batch_size']},fpu={config['fpu']},device={device}")
 
 
 def _append_csv(path: Path, row: dict) -> None:
@@ -144,8 +147,8 @@ def main():
 
         # 3. ゲーティング
         if args.gate_threshold > 0:
-            result = evaluate(_az_spec(checkpoint(gen), eval_sims, args.eval_device),
-                              _az_spec(checkpoint(best), eval_sims, args.eval_device),
+            result = evaluate(_az_spec(checkpoint(gen), config, eval_sims, args.eval_device),
+                              _az_spec(checkpoint(best), config, eval_sims, args.eval_device),
                               args.gate_games, jobs=jobs, seed=gen)
             accepted = result["rate"] >= args.gate_threshold
             _log(run, f"ゲーティング 世代 {gen} 対 世代 {best}: {format_result(result)} → "
@@ -162,7 +165,7 @@ def main():
         for agent in args.eval_agents:
             key = f"vs_{agent.split('@')[0]}"
             if args.eval_every > 0 and gen % args.eval_every == 0:
-                result = evaluate(_az_spec(checkpoint(state["best"]), eval_sims, args.eval_device), agent,
+                result = evaluate(_az_spec(checkpoint(state["best"]), config, eval_sims, args.eval_device), agent,
                                   args.eval_games, jobs=jobs, seed=10_000 + gen)
                 _log(run, f"評価 世代 {state['best']} 対 {agent}: {format_result(result)}")
                 row[key] = round(result["rate"], 4)
