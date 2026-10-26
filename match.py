@@ -73,6 +73,7 @@ AGENTS = {
     "oracle_eval": ("agent_ismcts_eval", "oracle_eval_move"),
     "azp": ("agent_az", "az_policy_move"),
     "az": ("agent_az", "az_move"),
+    "azo": ("agent_az", "az_oracle_move"),
 }
 
 

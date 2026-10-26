@@ -142,7 +142,7 @@ def run_steps(steps, evaluator):
 
 def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct: float = 1.5,
            batch_size: int = 16, fpu: float = 0.0, fpu_reduction: float | None = None, dirichlet_alpha: float = 0.0,
-           dirichlet_epsilon: float = 0.25, use_representatives: bool = True,
+           dirichlet_epsilon: float = 0.25, use_representatives: bool = True, sample_world=None,
            rng: random.Random | None = None) -> SearchResult:
     """obs (手番のプレイヤーの観測) から ISMCTS で探索し, ルートの統計を返す.
 
@@ -152,12 +152,12 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
     return run_steps(search_steps(obs, num_simulations=num_simulations, c_puct=c_puct, batch_size=batch_size, fpu=fpu,
                                   fpu_reduction=fpu_reduction, dirichlet_alpha=dirichlet_alpha,
                                   dirichlet_epsilon=dirichlet_epsilon, use_representatives=use_representatives,
-                                  rng=rng), evaluator)
+                                  sample_world=sample_world, rng=rng), evaluator)
 
 
 def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: float = 1.5, batch_size: int = 16,
                  fpu: float = 0.0, fpu_reduction: float | None = None, dirichlet_alpha: float = 0.0,
-                 dirichlet_epsilon: float = 0.25, use_representatives: bool = True,
+                 dirichlet_epsilon: float = 0.25, use_representatives: bool = True, sample_world=None,
                  rng: random.Random | None = None):
     """search と同じ探索を, ネットワークの評価を外に任せるジェネレータとして行う.
 
@@ -172,6 +172,8 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
     dirichlet_alpha: ルートの事前確率に混ぜるディリクレノイズの集中度 (0 なら混ぜない)
     dirichlet_epsilon: ディリクレノイズを混ぜる割合
     use_representatives: ルートで同等な手を1つの代表にまとめるか
+    sample_world: シミュレーションごとの局面を作る関数 (rng → GameState). 省略時は見えないカードを配り直す
+                  (determinization). 診断用に, 本当の相手の手札を使う局面などを渡せる (revealed_world_sampler)
     rng: 乱数 (determinization, ノイズ)
     """
     rng = rng or random.Random()
@@ -192,7 +194,13 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
     root_priors = np.ascontiguousarray(root_prior, dtype=np.float64)
     root_value = float(values[0])
 
-    base = obs.sample_state(seed=rng.getrandbits(64))
+    if sample_world is None:
+        base = obs.sample_state(seed=rng.getrandbits(64))
+
+        def sample_world(rng):
+            work = base.copy()
+            work.determinize(me, seed=rng.getrandbits(64))
+            return work
     root_masks = F.flag_card_masks(obs)      # フラッグに置かれたカード (determinization で変わらない)
     done = 0
     while done < num_simulations:
@@ -200,8 +208,7 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
         inputs = []
         for _ in range(min(batch_size, num_simulations - done)):
             done += 1
-            work = base.copy()
-            work.determinize(me, seed=rng.getrandbits(64))
+            work = sample_world(rng)
             node, path = root, []
             masks = list(root_masks)
             while True:
@@ -251,6 +258,36 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
     if total > 0:
         root_value = float((visits * q_values).sum() / total)
     return SearchResult(root_moves, visits, q_values, policy, root_value)
+
+
+def revealed_world_sampler(state, reveal: str = "hand"):
+    """本当の局面 state から, シミュレーションごとの局面を作る関数を返す (診断用. 相手の情報を見る「ずる」をする).
+
+    reveal="hand": 相手の手札は本当のものを使い, 山札の順番だけをシミュレーションごとにランダムにする
+    reveal="all":  山札の順番も含めて, 本当の局面をそのまま使う
+    """
+    if reveal == "all":
+        return lambda rng: state.copy()
+    if reveal != "hand":
+        raise ValueError(f"reveal must be 'hand' or 'all': {reveal}")
+    players = (pybl.FIRST, pybl.SECOND)
+    cards = lambda bits: [int(c) for c in pybl.CardIterator(bits)]
+    hands = tuple(cards(state.get_hand(p)) for p in players)
+    flags = [tuple([int(c) for c in state.get_flag_cards(i, p)] for p in players) for i in range(F.NUM_FLAGS)]
+    owners = [None if o == pybl.NULL_PLAYER else o for o in (state.get_flag_owner(i) for i in range(F.NUM_FLAGS))]
+    completers = [None if c == pybl.NULL_PLAYER else c
+                  for c in (state.get_flag_first_completer(i) for i in range(F.NUM_FLAGS))]
+    used = int(state.board_cards) | int(state.get_hand(players[0])) | int(state.get_hand(players[1]))
+    deck = cards(int(pybl.ALL_CARDS) & ~used)
+    side, first = state.side_to_move, state.first_player
+
+    def sample(rng):
+        order = list(deck)
+        rng.shuffle(order)
+        world = pybl.GameState()
+        world.set_position(side, hands, flags, order, owners, completers, first)
+        return world
+    return sample
 
 
 def _select_py(node, root, root_moves: list, root_priors: np.ndarray, work, c_puct: float, fpu: float,

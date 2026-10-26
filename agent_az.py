@@ -2,6 +2,7 @@
 
 az_move (match.py では az): ネットワークを使う ISMCTS (az/mcts.py, AlphaZero 型) で探索して手を選ぶ
 az_policy_move (azp): 探索を行わず, ネットワークの方策だけで手を選ぶ
+az_oracle_move (azo): 診断用. az_move と同じ探索で, 決定化の代わりに本当の相手の手札 (reveal=all なら山札の順番も) を使う
 
 実行時の指定 (match.py / play_vs_agent.py):
     python3 match.py 400 az abdeck -j 8
@@ -9,6 +10,7 @@ az_policy_move (azp): 探索を行わず, ネットワークの方策だけで�
     python3 match.py 400 az@fpu_reduction=0.2,c_puct=1.0 az -j 8
     python3 match.py 400 az@device=cuda abdeck -j 8         # 推論を GPU で行う (auto なら GPU があれば cuda)
     python3 match.py 400 azp random -j 8
+    python3 match.py 400 azo@checkpoint=checkpoints/pretrain.pt,device=cuda az@checkpoint=checkpoints/pretrain.pt,device=cuda -j 8
     python3 match.py 400 azp@checkpoint=checkpoints/pretrain.pt,temperature=0.5 abdeck -j 8
 
 使い方:
@@ -134,3 +136,41 @@ def az_move(obs: pybl.Observation, checkpoint: str = CHECKPOINT, num_simulations
 
 
 _evaluators = {}
+
+
+def az_oracle_move(obs: pybl.Observation, state: pybl.GameState, reveal: str = "hand", checkpoint: str = CHECKPOINT,
+                   num_simulations: int = NUM_SIMULATIONS, c_puct: float = C_PUCT, batch_size: int = BATCH_SIZE,
+                   fpu: float = 0.0, fpu_reduction: float | None = None, temperature: float = 0.0,
+                   device: str = "cpu", rng: random.Random | None = None):
+    """診断用: az_move と同じ探索で, 見えないカードを配り直す代わりに本当の局面 state の情報を使って手を選ぶ.
+
+    「相手の手札が分かっていたら, どれだけ強くなるか」(決定化を改善する余地の上限) を測るためのもので, ずるをする.
+    reveal: hand なら相手の手札だけ本当のものを使い, 山札の順番はシミュレーションごとにランダムにする.
+            all なら山札の順番も含めて本当の局面を使う
+    state: 本当の局面 (match.py が写しを渡す). その他の引数は az_move と同じ
+    """
+    if not isinstance(obs, pybl.Observation):
+        raise TypeError("obs must be a pybl.Observation (use GameState.observe())")
+    if state.observe(obs.player) != obs:
+        raise ValueError("state does not match obs")
+    moves = obs.get_legal_moves()
+    if len(moves) == 0:
+        if obs.is_terminal:
+            raise ValueError("the game is already over")
+        raise ValueError("it is not the observing player's turn")
+    if len(moves) == 1:
+        return moves[0]
+
+    from az.mcts import NetworkEvaluator, revealed_world_sampler, search
+    rng = rng or _default_rng
+    device = _device(device)
+    evaluator = _evaluators.get((checkpoint, device))
+    if evaluator is None:
+        evaluator = _evaluators[(checkpoint, device)] = NetworkEvaluator(_load(checkpoint, device), device)
+    result = search(obs, evaluator, num_simulations=int(num_simulations), c_puct=float(c_puct),
+                    batch_size=int(batch_size), fpu=float(fpu),
+                    fpu_reduction=None if fpu_reduction is None else float(fpu_reduction),
+                    sample_world=revealed_world_sampler(state, str(reveal)), rng=rng)
+    if len(result.moves) == 1:
+        return pybl.Move(result.moves[0])
+    return pybl.Move(result.sample_move(float(temperature), rng))

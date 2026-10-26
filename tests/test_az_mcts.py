@@ -197,3 +197,60 @@ def test_az_agents_on_device(tmp_path, device):
     assert state.is_legal(agent_az.az_move(obs, checkpoint=str(path), num_simulations=20, batch_size=4,
                                            device=device, rng=rng))
     assert state.is_legal(agent_az.az_policy_move(obs, checkpoint=str(path), device=device))
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_revealed_world_sampler(seed):
+    state = random_position(seed, max_moves=60)
+    me = state.side_to_move
+    opp = pybl.to_opponent(me)
+    sample = mcts.revealed_world_sampler(state, "hand")
+    rng = random.Random(seed)
+    decks = set()
+    for _ in range(5):
+        world = sample(rng)
+        # 見える情報と合法手は同じで, 相手の手札は本当のもの
+        assert world.observe(me) == state.observe(me)
+        assert world.get_legal_moves().tolist() == state.get_legal_moves().tolist()
+        assert int(world.get_hand(opp)) == int(state.get_hand(opp))
+        assert world.deck_count == state.deck_count
+        for i in range(pybl.NUM_FLAGS):
+            assert world.get_flag_owner(i) == state.get_flag_owner(i)
+            assert world.get_flag_first_completer(i) == state.get_flag_first_completer(i)
+        # 山札の順番はランダム (引いたカードで区別する)
+        if world.deck_count > 1:
+            world.play(world.get_legal_moves()[0])
+            decks.add(int(world.get_hand(me)))
+    if state.deck_count > 1:
+        assert len(decks) > 1
+
+    exact = mcts.revealed_world_sampler(state, "all")(rng)
+    assert exact.observe(opp) == state.observe(opp) and exact.observe(me) == state.observe(me)
+    with pytest.raises(ValueError):
+        mcts.revealed_world_sampler(state, "deck")
+
+
+def test_search_with_revealed_world():
+    state = random_position(4)
+    obs = state.observe(state.side_to_move)
+    result = mcts.search(obs, UniformEvaluator(), num_simulations=60, batch_size=4,
+                         sample_world=mcts.revealed_world_sampler(state, "hand"), rng=random.Random(0))
+    assert result.visits.sum() == 60
+
+
+def test_az_oracle_move_via_match(tmp_path):
+    torch = pytest.importorskip("torch")
+    from az.model import TokenNet, save_checkpoint
+    import match
+    path = tmp_path / "net.pt"
+    torch.manual_seed(0)
+    save_checkpoint(path, TokenNet(d_model=32, layers=1, heads=2))
+    agents = [match.load_agent(f"azo@checkpoint={path},num_simulations=16,batch_size=4,reveal={reveal}")
+              for reveal in ("hand", "all")]
+    rng = random.Random(0)
+    state = pybl.GameState(seed=5)
+    while not state.is_terminal:
+        agent = agents[state.move_count % 2]
+        move = agent.choose(state.observe(state.side_to_move), rng, state)
+        assert state.is_legal(move)
+        state.play(move)
