@@ -3,6 +3,8 @@
 1世代の流れ:
     1. 自己対戦: 最も強いネットワーク (best) と ISMCTS で games 局を行い, data/gen_XXXX に保存する
     2. 学習: 最新のネットワークから, 直近 window 世代分の自己対戦のデータで学習し, checkpoints/gen_XXXX.pt に保存する
+       (学習は別のプロセスで行う. 学習で使った GPU のメモリを, プロセスの終了とともに全て解放するため.
+        同じプロセスで学習すると PyTorch が確保したメモリが残り, 次の自己対戦で GPU のメモリが足りなくなる)
     3. ゲーティング: 新しいネットワークと best を gate_games 試合対戦させ, 勝率が gate_threshold 以上なら best を更新する
        (gate_threshold が 0 なら対戦せずに常に更新する)
     4. 既存のエージェントとの比較: eval_every 世代ごとに, best を eval_agents と対戦させる
@@ -17,10 +19,13 @@ CPU アフィニティは match.py と同じく, 環境変数 BL_AFFINITY (ま�
 import argparse
 import csv
 import json
+import multiprocessing as mp
 import os
 import shutil
+import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent      # bl_ex のディレクトリ
@@ -34,6 +39,39 @@ def _log(run: Path, text: str) -> None:
     print(line, flush=True)
     with open(run / "loop.log", "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def _gpu_memory() -> str | None:
+    """nvidia-smi で GPU のメモリの使用量を調べる (このプロセスでは CUDA を使わない). 調べられなければ None"""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10)
+        used, total = out.stdout.strip().splitlines()[0].split(",")
+        return f"{int(used)} / {int(total)} MiB"
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def _train(task: dict) -> dict:
+    """1世代分の学習 (別のプロセスで呼ばれる). 学習したネットワークを task["out"] に保存し, 損失を返す"""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from az.model import load_checkpoint
+    from az.train import fit, load_dataset
+    run = Path(task["run"])
+    model, _ = load_checkpoint(task["init"], device="cpu")
+    result = fit(model, load_dataset(task["data"]), out=task["out"], epochs=task["epochs"],
+                 batch_size=task["batch_size"], lr=task["lr"], weight_decay=task["weight_decay"],
+                 value_weight=task["value_weight"], q_weight=task["q_weight"], device=task["device"],
+                 seed=task["generation"], keep_best=False, log=lambda text: _log(run, text), kind="selfplay",
+                 generation=task["generation"], data=task["data"])
+    return {"train_loss": float(result["train_loss"]), "val": result["val"]}
+
+
+def _train_in_subprocess(task: dict) -> dict:
+    """_train を別のプロセスで実行する. プロセスが終わると, 学習で使った GPU のメモリが全て解放される"""
+    with ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as executor:
+        return executor.submit(_train, task).result()
 
 
 def _az_spec(checkpoint: Path, config: dict, simulations: int, device: str = "cpu") -> str:
@@ -89,8 +127,7 @@ def main():
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from match import apply_cpu_affinity
-    from az.model import build_model, load_checkpoint, save_checkpoint
-    from az.train import fit, load_dataset
+    from az.model import build_model, save_checkpoint
 
     run = Path(args.run).resolve()
     (run / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -128,6 +165,9 @@ def main():
         _log(run, f"===== 世代 {gen} (自己対戦は世代 {best} のネットワーク) =====")
 
         # 1. 自己対戦 (既にデータがあれば, 途中で止めた世代なので作り直す)
+        memory = _gpu_memory()
+        if memory:
+            _log(run, f"GPU のメモリの使用量: {memory}")
         if data_dir(gen).exists():
             shutil.rmtree(data_dir(gen))
         stats = selfplay.generate(checkpoint(best), args.games, data_dir(gen), config, jobs=jobs, affinity=None,
@@ -137,13 +177,12 @@ def main():
 
         # 2. 学習 (最新のネットワークから, 直近 window 世代分のデータで)
         window = [data_dir(g) for g in range(max(1, gen - args.window + 1), gen + 1) if data_dir(g).exists()]
-        model, _ = load_checkpoint(checkpoint(gen - 1), device="cpu")
         start = time.perf_counter()
-        fit_result = fit(model, load_dataset(window), out=checkpoint(gen), epochs=args.epochs,
-                         batch_size=args.train_batch_size, lr=args.lr, weight_decay=args.weight_decay,
-                         value_weight=args.value_weight, q_weight=args.q_weight, device=args.device, seed=gen,
-                         keep_best=False, log=lambda text: _log(run, text), kind="selfplay", generation=gen,
-                         data=[str(d) for d in window])
+        fit_result = _train_in_subprocess({
+            "run": str(run), "init": str(checkpoint(gen - 1)), "out": str(checkpoint(gen)),
+            "data": [str(d) for d in window], "generation": gen, "epochs": args.epochs,
+            "batch_size": args.train_batch_size, "lr": args.lr, "weight_decay": args.weight_decay,
+            "value_weight": args.value_weight, "q_weight": args.q_weight, "device": args.device})
         val = fit_result["val"] or {}
         row.update(train_seconds=round(time.perf_counter() - start), train_loss=round(fit_result["train_loss"], 4),
                    val_value_loss=round(val.get("value", float("nan")), 4),
