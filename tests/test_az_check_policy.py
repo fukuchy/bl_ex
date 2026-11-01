@@ -91,6 +91,28 @@ def test_network_stats(run):
     assert 0 < n["net_entropy"] <= np.log(F.NUM_ACTIONS)
 
 
+def test_network_stats_value(run):
+    import torch
+    from az.check_policy import network_stats
+    from az.model import load_checkpoint
+    root, checkpoint = run
+    data = load_sample(root / "data" / "gen_0001", max_files=0)
+    assert "values" in data and "q" in data
+    model, _ = load_checkpoint(checkpoint)
+    with torch.no_grad():
+        _, v = model(torch.as_tensor(data["planes"], dtype=torch.float32), torch.as_tensor(data["scalars"]))
+    v = v.numpy().astype(np.float64)
+    z, q = data["values"].astype(np.float64), data["q"].astype(np.float64)
+    n = network_stats(model, data, batch_size=7, q_weight=0.5)
+    assert n["value_z"] == pytest.approx(((v - z) ** 2).mean(), rel=1e-4)
+    assert n["value_target"] == pytest.approx(((v - (0.5 * z + 0.5 * q)) ** 2).mean(), rel=1e-4)
+    zero = network_stats(model, data, batch_size=7, q_weight=0.0)
+    assert zero["value_target"] == pytest.approx(zero["value_z"])
+    # q の無いデータでは, 正解に対する誤差は z に対する誤差と同じ
+    no_q = {k: v for k, v in data.items() if k != "q"}
+    assert network_stats(model, no_q, q_weight=0.5)["value_target"] == pytest.approx(n["value_z"], rel=1e-4)
+
+
 def test_main(run, monkeypatch, capsys):
     from az import check_policy
     root, checkpoint = run
@@ -99,4 +121,4 @@ def test_main(run, monkeypatch, capsys):
     check_policy.main()
     out = capsys.readouterr().out
     assert "gen_0001" in out and "gen_0002" in out and "飛ばす" in out
-    assert "ネットワーク gen_0000" in out
+    assert "ネットワーク gen_0000" in out and "価値の誤差(z)" in out

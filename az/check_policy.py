@@ -7,12 +7,15 @@
     局面数, 合法手の数, H(π) (π のエントロピー), H(π)/log(合法手の数) (一様分布で 1),
     exp(H(π)) (実質的な候補手の数), π の最大の確率
 
---checkpoint を指定すると, 同じ局面でのネットワークの方策 p について次も表示する:
-    H(p) (事前確率のエントロピー), 交差エントロピー H(π)+KL, KL(π‖p), π と p の最善手の一致率
+--checkpoint を指定すると, 同じ局面でのネットワークの出力について次も表示する:
+    方策 p: H(p) (事前確率のエントロピー), 交差エントロピー H(π)+KL, KL(π‖p), π と p の最善手の一致率
+    価値 v: 勝敗 z に対する二乗誤差, 学習の正解 (1 − q_weight) × z + q_weight × q に対する二乗誤差
+            (q_weight は --q-weight. 学習の損失の価値の部分と同じもの. データに q が無ければ z に対する誤差と同じ)
 
     python -m az.check_policy --run runs/az3
     python -m az.check_policy --run runs/az3 --checkpoint runs/az3/checkpoints/gen_0000.pt runs/az3/checkpoints/gen_0006.pt
     python -m az.check_policy --data runs/az3/data/gen_0001 runs/az3/data/gen_0007 --max-files 0
+    python -m az.check_policy --data runs/az5/data/gen_0011 --max-files 0 --q-weight 0.5 --checkpoint a.pt b.pt
 
 bl_ex のディレクトリで実行する.
 """
@@ -60,14 +63,25 @@ def policy_stats(policy: np.ndarray, masks: np.ndarray) -> dict:
     }
 
 
-def network_stats(model, data: dict, device: str = "cpu", batch_size: int = 4096) -> dict:
-    """同じ局面でのネットワークの方策 p と π を比べた統計 (局面ごとの値の平均) を返す"""
+def value_targets(data: dict, q_weight: float) -> tuple:
+    """(勝敗 z, 学習の正解 (1 − q_weight) × z + q_weight × q). データに q が無ければ両方とも z"""
+    z = data["values"].astype(np.float64)
+    if "q" not in data or q_weight == 0:
+        return z, z
+    return z, (1 - q_weight) * z + q_weight * data["q"].astype(np.float64)
+
+
+def network_stats(model, data: dict, device: str = "cpu", batch_size: int = 4096, q_weight: float = 0.5) -> dict:
+    """同じ局面でのネットワークの出力を正解と比べた統計 (局面ごとの値の平均) を返す.
+    方策: H(p), 交差エントロピー, KL(π‖p), 最善手の一致率. 価値: z に対する二乗誤差, 学習の正解に対する二乗誤差"""
     import torch
     from az.model import masked_log_softmax
 
     target = data["policy"].astype(np.float32)
     target = target / np.clip(target.sum(axis=1, keepdims=True), EPS, None)
-    totals = {"net_entropy": 0.0, "cross_entropy": 0.0, "kl": 0.0, "top1_agree": 0.0}
+    z, mixed = value_targets(data, q_weight)
+    totals = {"net_entropy": 0.0, "cross_entropy": 0.0, "kl": 0.0, "top1_agree": 0.0, "value_z": 0.0,
+              "value_target": 0.0}
     n = len(target)
     model = model.to(device).eval()
     with torch.no_grad():
@@ -76,7 +90,10 @@ def network_stats(model, data: dict, device: str = "cpu", batch_size: int = 4096
             planes = torch.as_tensor(data["planes"][sl], dtype=torch.float32, device=device)
             scalars = torch.as_tensor(data["scalars"][sl], dtype=torch.float32, device=device)
             masks = torch.as_tensor(data["masks"][sl], dtype=torch.bool, device=device)
-            logits, _ = model(planes, scalars)
+            logits, value = model(planes, scalars)
+            v = value.float().cpu().numpy().astype(np.float64)
+            totals["value_z"] += float(((v - z[sl]) ** 2).sum())
+            totals["value_target"] += float(((v - mixed[sl]) ** 2).sum())
             log_p = masked_log_softmax(logits, masks).cpu().numpy().astype(np.float64)
             pi = target[sl].astype(np.float64)
             p = np.exp(log_p)
@@ -93,16 +110,17 @@ def load_sample(directory, max_files: int, seed: int = 0) -> dict | None:
     files = sorted(glob.glob(os.path.join(str(directory), "*.npz")))
     if max_files > 0 and len(files) > max_files:
         files = sorted(random.Random(seed).sample(files, max_files))
-    keys = ("planes", "scalars", "masks", "policy")
+    keys = ("planes", "scalars", "masks", "policy", "values", "q")
     parts = []
     for path in files:
         with np.load(path) as z:
             if "policy" not in z.files:
                 return None
-            parts.append({k: z[k] for k in keys})
+            parts.append({k: z[k] for k in keys if k in z.files})
     if not parts:
         return None
-    return {k: np.concatenate([p[k] for p in parts]) for k in keys}
+    common = set.intersection(*(set(p) for p in parts))
+    return {k: np.concatenate([p[k] for p in parts]) for k in keys if k in common}
 
 
 def main():
@@ -110,7 +128,9 @@ def main():
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--run", help="az.loop の実行のディレクトリ (data/gen_* を全て調べる)")
     source.add_argument("--data", nargs="+", help="調べるデータのディレクトリ (複数可)")
-    parser.add_argument("--checkpoint", nargs="*", default=[], help="同じ局面で方策を比べるネットワーク (複数可)")
+    parser.add_argument("--checkpoint", nargs="*", default=[], help="同じ局面で出力を比べるネットワーク (複数可)")
+    parser.add_argument("--q-weight", type=float, default=0.5,
+                        help="価値の学習の正解に混ぜる探索の価値 q の割合 (az.loop の --q-weight と同じにする)")
     parser.add_argument("--max-files", type=int, default=10, help="各世代で読み込むファイルの数 (0 で全て)")
     parser.add_argument("--device", default=None, help="ネットワークの推論に使う装置 (省略時は GPU があれば cuda)")
     parser.add_argument("--seed", type=int, default=0)
@@ -140,13 +160,14 @@ def main():
         rows.append((directory, data, s))
 
     for name, model in models:
-        print(f"\nネットワーク {name} の方策 p との比較")
+        print(f"\nネットワーク {name} の出力との比較 (価値の正解 = {1 - args.q_weight:g} × z + {args.q_weight:g} × q)")
         print(_header([("データ", 12), ("H(π)", 8), ("H(p)", 8), ("交差エントロピー", 18), ("KL(π‖p)", 10),
-                       ("最善手の一致率", 16)]))
+                       ("最善手の一致率", 16), ("価値の誤差(z)", 16), ("価値の誤差(正解)", 18)]))
         for directory, data, s in rows:
-            n = network_stats(model, data, device=device)
+            n = network_stats(model, data, device=device, q_weight=args.q_weight)
             print(f"{directory.name:<12}{s['entropy']:>8.3f}{n['net_entropy']:>8.3f}{n['cross_entropy']:>18.3f}"
-                  f"{n['kl']:>10.3f}{n['top1_agree'] * 100:>15.1f}%", flush=True)
+                  f"{n['kl']:>10.3f}{n['top1_agree'] * 100:>15.1f}%{n['value_z']:>16.4f}{n['value_target']:>18.4f}",
+                  flush=True)
 
 
 if __name__ == "__main__":
