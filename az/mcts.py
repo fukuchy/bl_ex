@@ -23,6 +23,18 @@ v1 の ISMCTS (agent_ismcts.py) と同じく, シミュレーションごとに�
     - v1 と同じく, 厳密に同等な手 (フラッグの左右対称・色の入れ替え) を1つの代表にまとめて探索する
     - 自己対戦では, 事前確率にディリクレノイズを混ぜて探索を促す (dirichlet_alpha > 0)
     - 結果の訪問回数の分布は, 代表の手の訪問回数を同等な手に均等に分けて, 541 通りの行動に戻す (学習の正解 π)
+
+ルート以外のノードの事前確率 (prior_cache):
+    none (既定): ノードを最初に評価したときの determinization でのロジットを, 以降の別の determinization でも使い回す.
+          ルート以外では手番のプレイヤーの手札が determinization ごとに違う (相手のノードでは相手の手札,
+          深さ 2 以降の自分のノードでは山札から引いたカード) ので, 評価したときの手札に無かったカードの手のロジット
+          (学習で勾配が流れていない値) で PUCT が動くことがある
+    hand: ノードごとに {手番のプレイヤーの手札: ロジット} を持ち, 今の determinization の手札のロジットを使う.
+          まだ評価していない手札に当たったら, そのノードをこのシミュレーションの葉として今の局面をネットワークで評価し,
+          ロジットをその手札で保存して価値を逆伝播する (1シミュレーションあたりの評価は1回のまま).
+          同じバッチの別のシミュレーションが評価待ちにしたノードと手札でも, 価値 0 で済ませずに評価を要求する
+          (同じ入力を2回評価することになるが, ロジットは先に保存したものを使う)
+    stats (PriorStats) を渡すと, 事前確率の使い回しの度合いを集計する (診断用. az.diag_prior)
 """
 import math
 import random
@@ -35,7 +47,7 @@ from az import features as F
 
 
 class _PyNode:
-    __slots__ = ("move", "player", "parent", "children", "visits", "value_sum", "logits")
+    __slots__ = ("move", "player", "parent", "children", "visits", "value_sum", "logits", "hand", "cache")
 
     def __init__(self, move, player, parent):
         self.move = move            # このノードに至った着手 (ルートは None)
@@ -45,12 +57,16 @@ class _PyNode:
         self.visits = 0             # 訪問回数 N
         self.value_sum = 0.0        # 価値の合計 W (-1〜1 の値の合計)
         self.logits = None          # ネットワークで評価したときの方策のロジット (541,). 未評価なら None
+        self.hand = None            # logits を評価したときの手番のプレイヤーの手札 (stats を集計するときだけ記録する)
+        self.cache = None           # prior_cache="hand" のときの {手番のプレイヤーの手札: ロジット}
 
 
 try:
     from az._fast import Node      # Cython 版 (python setup.py build_ext --inplace でビルドする)
 except ImportError:
     Node = _PyNode
+if Node is not _PyNode and not hasattr(Node(None, None, None), "cache"):
+    raise ImportError("az/_fast (Cython 版) のビルドが古い. bl_ex のディレクトリで python setup.py build_ext --inplace を実行する")
 
 
 class NetworkEvaluator:
@@ -94,6 +110,59 @@ class SearchResult:
         if weights.sum() <= 0:
             return self.best_move()
         return int(self.moves[rng.choices(range(len(self.moves)), weights=weights)[0]])
+
+
+PRIOR_CACHES = ("none", "hand")
+
+
+class PriorStats:
+    """診断用: 探索中に, ルート以外のノードで事前確率をどれだけ別の手札のものから使い回しているかを集計する.
+
+    search / search_steps に stats として渡す (渡さなければ集計しないので, 通常の探索は遅くならない).
+    深さはルートからの手数 (1, 2, 3 以上にまとめる), 手番はルートのプレイヤーか相手かで分ける.
+
+    select[(深さ, ルートのプレイヤーの手番か)] = [選択の回数, 手札が違った回数, 無いカードの手の割合の合計,
+                                               無いカードの手の子の訪問回数の合計, 合法手の子の訪問回数の合計]
+        手札が違う: 今の determinization の手番のプレイヤーの手札が, 使ったロジットを評価したときの手札と違う
+        無いカードの手: 今の合法手のうち, 評価したときの手札に無かったカードを使う手
+    arrive[(深さ, ルートのプレイヤーの手番か)] = [到達の回数, 手札のロジットがまだ無かった回数] (prior_cache="hand")
+    leaves: 葉の種類ごとの数 (eval: ネットワークで評価, terminal: 終局, collision: 評価待ちと重なって価値 0) と深さの合計
+    """
+
+    def __init__(self):
+        self.searches = 0
+        self.select = {}
+        self.arrive = {}
+        self.leaves = {"eval": 0, "terminal": 0, "collision": 0, "depth": 0}
+
+    def record_leaf(self, kind: str, depth: int) -> None:
+        self.leaves[kind] += 1
+        self.leaves["depth"] += depth
+
+    def record_arrive(self, depth: int, own: bool, miss: bool) -> None:
+        row = self.arrive.setdefault((min(depth, 3), own), [0, 0])
+        row[0] += 1
+        row[1] += miss
+
+    def record_select(self, depth: int, own: bool, saved_hand: int, work, node) -> None:
+        """node で選択を行う直前に呼ぶ. saved_hand は使うロジットを評価したときの手番のプレイヤーの手札"""
+        current = int(work.get_hand(work.side_to_move))
+        missing = current & ~saved_hand
+        legal = work.get_legal_moves().tolist()
+        count, weighted, total = 0, 0, 0
+        for m in legal:
+            child = node.children.get(m)
+            n = child.visits if child is not None else 0
+            total += n
+            if m != _PASS and (missing >> (m // F.NUM_FLAGS)) & 1:
+                count += 1
+                weighted += n
+        row = self.select.setdefault((min(depth, 3), own), [0, 0, 0.0, 0, 0])
+        row[0] += 1
+        row[1] += current != saved_hand
+        row[2] += count / len(legal)
+        row[3] += weighted
+        row[4] += total
 
 
 def _equivalence_classes(obs: pybl.Observation, use_representatives: bool) -> dict:
@@ -143,6 +212,7 @@ def run_steps(steps, evaluator):
 def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct: float = 1.5,
            batch_size: int = 16, fpu: float = 0.0, fpu_reduction: float | None = None, dirichlet_alpha: float = 0.0,
            dirichlet_epsilon: float = 0.25, use_representatives: bool = True, sample_world=None,
+           prior_cache: str = "none", stats: PriorStats | None = None,
            rng: random.Random | None = None) -> SearchResult:
     """obs (手番のプレイヤーの観測) から ISMCTS で探索し, ルートの統計を返す.
 
@@ -152,13 +222,14 @@ def search(obs: pybl.Observation, evaluator, num_simulations: int = 200, c_puct:
     return run_steps(search_steps(obs, num_simulations=num_simulations, c_puct=c_puct, batch_size=batch_size, fpu=fpu,
                                   fpu_reduction=fpu_reduction, dirichlet_alpha=dirichlet_alpha,
                                   dirichlet_epsilon=dirichlet_epsilon, use_representatives=use_representatives,
-                                  sample_world=sample_world, rng=rng), evaluator)
+                                  sample_world=sample_world, prior_cache=prior_cache, stats=stats, rng=rng),
+                     evaluator)
 
 
 def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: float = 1.5, batch_size: int = 16,
                  fpu: float = 0.0, fpu_reduction: float | None = None, dirichlet_alpha: float = 0.0,
                  dirichlet_epsilon: float = 0.25, use_representatives: bool = True, sample_world=None,
-                 rng: random.Random | None = None):
+                 prior_cache: str = "none", stats: PriorStats | None = None, rng: random.Random | None = None):
     """search と同じ探索を, ネットワークの評価を外に任せるジェネレータとして行う.
 
     評価してほしい局面を (planes (B, ...), scalars (B, ...)) として yield し, (方策のロジット (B, 541), 価値 (B,)) を
@@ -174,8 +245,15 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
     use_representatives: ルートで同等な手を1つの代表にまとめるか
     sample_world: シミュレーションごとの局面を作る関数 (rng → GameState). 省略時は見えないカードを配り直す
                   (determinization). 診断用に, 本当の相手の手札を使う局面などを渡せる (revealed_world_sampler)
+    prior_cache: ルート以外のノードの事前確率の扱い. none (評価したときのロジットを使い回す) / hand (手札ごとに評価する)
+    stats: PriorStats を渡すと, 事前確率の使い回しの度合いを集計する (診断用)
     rng: 乱数 (determinization, ノイズ)
     """
+    if prior_cache not in PRIOR_CACHES:
+        raise ValueError(f"prior_cache must be one of {PRIOR_CACHES}: {prior_cache}")
+    by_hand = prior_cache == "hand"
+    if stats is not None:
+        stats.searches += 1
     rng = rng or random.Random()
     me = obs.player
     classes = _equivalence_classes(obs, use_representatives)
@@ -204,7 +282,7 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
     root_masks = F.flag_card_masks(obs)      # フラッグに置かれたカード (determinization で変わらない)
     done = 0
     while done < num_simulations:
-        pending = []        # (葉のノード, 経路, 葉の局面の手番のプレイヤー)
+        pending = []        # (葉のノード, 経路, 葉の局面の手番のプレイヤー, その手札 (by_hand か stats のときだけ))
         inputs = []
         for _ in range(min(batch_size, num_simulations - done)):
             done += 1
@@ -214,17 +292,38 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
             while True:
                 if work.is_terminal:
                     _backup(path, lambda p, s=work: _terminal_value(s, p), virtual=True)
+                    if stats is not None:
+                        stats.record_leaf("terminal", len(path))
                     break
-                if node is not root and node.logits is None:
-                    if node.visits > 1:     # 同じバッチの別のシミュレーションが評価待ちにしたノード
-                        _backup(path, lambda p: 0.0, virtual=True)
+                logits = None       # None なら _select は node.logits を使う
+                if node is not root:
+                    if by_hand:
+                        hand = int(work.get_hand(work.side_to_move))
+                        logits = node.cache.get(hand) if node.cache is not None else None
+                        if stats is not None:
+                            stats.record_arrive(len(path), work.side_to_move == me, logits is None)
+                        if logits is None:
+                            # この手札ではまだ評価していないので, ここを葉として今の局面を評価する
+                            planes, scalars = F.encode(work.observe(work.side_to_move), masks)
+                            inputs.append((planes, scalars))
+                            pending.append((node, path, work.side_to_move, hand))
+                            break
+                    elif node.logits is None:
+                        if node.visits > 1:     # 同じバッチの別のシミュレーションが評価待ちにしたノード
+                            _backup(path, lambda p: 0.0, virtual=True)
+                            if stats is not None:
+                                stats.record_leaf("collision", len(path))
+                            break
+                        o = work.observe(work.side_to_move)
+                        planes, scalars = F.encode(o, masks)
+                        inputs.append((planes, scalars))
+                        hand = int(work.get_hand(work.side_to_move)) if stats is not None else None
+                        pending.append((node, path, work.side_to_move, hand))
                         break
-                    o = work.observe(work.side_to_move)
-                    planes, scalars = F.encode(o, masks)
-                    inputs.append((planes, scalars))
-                    pending.append((node, path, work.side_to_move))
-                    break
-                move = _select(node, root, root_moves, root_priors, work, c_puct, fpu, fpu_reduction)
+                    if stats is not None:
+                        stats.record_select(len(path), work.side_to_move == me,
+                                            hand if by_hand else node.hand, work, node)
+                move = _select(node, root, root_moves, root_priors, work, c_puct, fpu, fpu_reduction, logits)
                 mover = work.side_to_move
                 child = node.children.get(move)
                 if child is None:
@@ -240,9 +339,17 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
 
         if pending:
             logits, values = yield np.stack([x[0] for x in inputs]), np.stack([x[1] for x in inputs])
-            for (node, path, to_move), node_logits, value in zip(pending, logits, values):
-                if node.logits is None:
+            for (node, path, to_move, hand), node_logits, value in zip(pending, logits, values):
+                if by_hand:
+                    if node.cache is None:
+                        node.cache = {}
+                    if hand not in node.cache:      # 同じバッチで同じ手札を2回評価したときは先のものを使う
+                        node.cache[hand] = np.ascontiguousarray(node_logits, dtype=np.float32)
+                elif node.logits is None:
                     node.logits = np.ascontiguousarray(node_logits, dtype=np.float32)
+                    node.hand = hand
+                if stats is not None:
+                    stats.record_leaf("eval", len(path))
                 v = float(value)
                 _backup(path, lambda p, v=v, t=to_move: v if p == t else -v, virtual=True)
 
@@ -291,14 +398,15 @@ def revealed_world_sampler(state, reveal: str = "hand"):
 
 
 def _select_py(node, root, root_moves: list, root_priors: np.ndarray, work, c_puct: float, fpu: float,
-               fpu_reduction: float | None = None) -> int:
-    """PUCT で手を選ぶ (root_priors は root_moves の順のルートの事前確率). Cython 版 (_fast.select) と同じ計算をする"""
+               fpu_reduction: float | None = None, node_logits: np.ndarray | None = None) -> int:
+    """PUCT で手を選ぶ (root_priors は root_moves の順のルートの事前確率). Cython 版 (_fast.select) と同じ計算をする.
+    node_logits: ルート以外の事前確率に使うロジット (省略時は node.logits)"""
     if node is root:
         legal = root_moves
         priors = root_priors
     else:
         legal = work.get_legal_moves()
-        priors = _softmax(node.logits[legal].astype(np.float64))
+        priors = _softmax((node.logits if node_logits is None else node_logits)[legal].astype(np.float64))
         legal = legal.tolist()
     children = node.children
     total, value_total, visited_prior = 0, 0.0, 0.0

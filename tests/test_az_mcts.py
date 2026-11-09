@@ -254,3 +254,117 @@ def test_az_oracle_move_via_match(tmp_path):
         move = agent.choose(state.observe(state.side_to_move), rng, state)
         assert state.is_legal(move)
         state.play(move)
+
+
+class HandEvaluator(UniformEvaluator):
+    """カード c の手 (c * 9 + フラッグ) のロジットに, 評価した局面の手番のプレイヤーの手札にカード c があるかを入れる.
+    価値は入力から決まる値"""
+
+    def __call__(self, planes, scalars):
+        logits, _ = super().__call__(planes, scalars)
+        hand = planes.reshape(len(planes), F.NUM_PLANES, F.NUM_CARDS)[:, F.PLANE_HAND]
+        logits[:, :F.NUM_CARDS * F.NUM_FLAGS] = np.repeat(hand, F.NUM_FLAGS, axis=1)
+        values = np.tanh(scalars.sum(axis=1) * 0.1 - planes.reshape(len(planes), -1).mean(axis=1))
+        return logits, values.astype(np.float32)
+
+
+def search_with_root(obs, evaluator, monkeypatch, **kwargs):
+    """探索して, (結果, ルートのノード) を返す"""
+    roots = []
+    original = mcts.Node
+
+    class RecordingNode(original):
+        __slots__ = ()
+
+        def __init__(self, move, player, parent):
+            super().__init__(move, player, parent)
+            if parent is None:
+                roots.append(self)
+
+    monkeypatch.setattr(mcts, "Node", RecordingNode)
+    result = mcts.search(obs, evaluator, **kwargs)
+    monkeypatch.setattr(mcts, "Node", original)
+    return result, roots[-1]
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_prior_cache_none_is_default_and_stats_do_not_change_result(seed):
+    state = random_position(seed, max_moves=40)
+    obs = state.observe(state.side_to_move)
+    kwargs = dict(num_simulations=120, batch_size=8, c_puct=1.0, fpu_reduction=0.2, dirichlet_alpha=0.3)
+    default = mcts.search(obs, HandEvaluator(), rng=random.Random(seed), **kwargs)
+    for extra in ({"prior_cache": "none"}, {"prior_cache": "none", "stats": mcts.PriorStats()}):
+        other = mcts.search(obs, HandEvaluator(), rng=random.Random(seed), **kwargs, **extra)
+        assert other.moves == default.moves and np.array_equal(other.visits, default.visits)
+        assert np.array_equal(other.q_values, default.q_values)
+    hand_stats = mcts.PriorStats()
+    a = mcts.search(obs, HandEvaluator(), rng=random.Random(seed), prior_cache="hand", **kwargs)
+    b = mcts.search(obs, HandEvaluator(), rng=random.Random(seed), prior_cache="hand", stats=hand_stats, **kwargs)
+    assert np.array_equal(a.visits, b.visits) and np.array_equal(a.q_values, b.q_values)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_prior_cache_hand_evaluates_once_per_simulation(seed):
+    state = random_position(seed, max_moves=70)
+    obs = state.observe(state.side_to_move)
+    evaluator, stats = HandEvaluator(), mcts.PriorStats()
+    result = mcts.search(obs, evaluator, num_simulations=200, batch_size=16, c_puct=1.0, fpu_reduction=0.2,
+                         prior_cache="hand", stats=stats, rng=random.Random(seed))
+    evaluations = sum(evaluator.batch_sizes) - 1                 # ルートの評価を除く
+    assert result.visits.sum() == 200
+    assert stats.leaves["collision"] == 0
+    assert evaluations == stats.leaves["eval"]
+    assert evaluations + stats.leaves["terminal"] == 200        # 終局で終わったシミュレーション以外は1回ずつ評価する
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_prior_cache_hand_uses_logits_of_current_hand(seed, monkeypatch):
+    state = random_position(seed, max_moves=40)
+    obs = state.observe(state.side_to_move)
+    stats = mcts.PriorStats()
+    _, root = search_with_root(obs, HandEvaluator(), monkeypatch, num_simulations=200, batch_size=8,
+                               prior_cache="hand", stats=stats, rng=random.Random(seed))
+    cached = 0
+    for node in walk(root):
+        assert node.logits is None
+        for hand, logits in (node.cache or {}).items():
+            bits = logits[:F.NUM_CARDS * F.NUM_FLAGS:F.NUM_FLAGS]     # カード c の手 c * 9 のロジット = 手札にあるか
+            assert sum(1 << c for c in range(F.NUM_CARDS) if bits[c] > 0.5) == hand
+            cached += 1
+    assert cached > 50
+    assert all(row[1] == 0 and row[3] == 0 for row in stats.select.values())     # 手札の不一致は無い
+
+
+def test_prior_stats_detect_reused_priors():
+    """prior_cache=none では, 深さ 1 の相手のノードで, 評価したときと違う相手の手札のロジットを使う"""
+    state = random_position(1, max_moves=10)
+    obs = state.observe(state.side_to_move)
+    stats = mcts.PriorStats()
+    mcts.search(obs, HandEvaluator(), num_simulations=300, batch_size=8, stats=stats, rng=random.Random(0))
+    n, mismatch, simple, weighted, total = stats.select[(1, False)]
+    assert n > 0 and mismatch / n > 0.5 and simple > 0
+    assert stats.arrive == {}
+    leaves = stats.leaves
+    assert leaves["eval"] + leaves["terminal"] + leaves["collision"] == 300
+
+
+def test_invalid_prior_cache():
+    state = random_position(0)
+    with pytest.raises(ValueError):
+        mcts.search(state.observe(state.side_to_move), UniformEvaluator(), num_simulations=8, prior_cache="world")
+
+
+def test_az_move_with_prior_cache_via_match(tmp_path):
+    torch = pytest.importorskip("torch")
+    from az.model import TokenNet, save_checkpoint
+    import match
+    path = tmp_path / "net.pt"
+    torch.manual_seed(0)
+    save_checkpoint(path, TokenNet(d_model=32, layers=1, heads=2))
+    agent = match.load_agent(f"az@checkpoint={path},num_simulations=16,batch_size=4,prior_cache=hand")
+    rng = random.Random(0)
+    state = pybl.GameState(seed=6)
+    while not state.is_terminal:
+        move = agent.choose(state.observe(state.side_to_move), rng, state)
+        assert state.is_legal(move)
+        state.play(move)

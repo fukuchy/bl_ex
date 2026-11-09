@@ -8,6 +8,7 @@ az_oracle_move (azo): 診断用. az_move と同じ探索で, 決定化の代わ�
     python3 match.py 400 az abdeck -j 8
     python3 match.py 400 az@checkpoint=checkpoints/pretrain.pt,num_simulations=400,c_puct=2.0 abdeck -j 8
     python3 match.py 400 az@fpu_reduction=0.2,c_puct=1.0 az -j 8
+    python3 match.py 400 az@fpu_reduction=0.2,c_puct=1.0,prior_cache=hand az@fpu_reduction=0.2,c_puct=1.0 -j 8
     python3 match.py 400 az@device=cuda abdeck -j 8         # 推論を GPU で行う (auto なら GPU があれば cuda)
     python3 match.py 400 azp random -j 8
     python3 match.py 400 azo@checkpoint=checkpoints/pretrain.pt,device=cuda az@checkpoint=checkpoints/pretrain.pt,device=cuda -j 8
@@ -95,8 +96,8 @@ def az_policy_move(obs: pybl.Observation, checkpoint: str = CHECKPOINT, temperat
 
 def az_move(obs: pybl.Observation, checkpoint: str = CHECKPOINT, num_simulations: int = NUM_SIMULATIONS,
             c_puct: float = C_PUCT, batch_size: int = BATCH_SIZE, fpu: float = 0.0,
-            fpu_reduction: float | None = None, temperature: float = 0.0, device: str = "cpu",
-            rng: random.Random | None = None):
+            fpu_reduction: float | None = None, prior_cache: str = "none", temperature: float = 0.0,
+            device: str = "cpu", rng: random.Random | None = None):
     """obs (手番のプレイヤーから見える情報) をもとに, ネットワークを使う ISMCTS で着手を選んで返す.
 
     checkpoint: 学習したネットワークのファイル
@@ -105,6 +106,8 @@ def az_move(obs: pybl.Observation, checkpoint: str = CHECKPOINT, num_simulations
     batch_size: まとめてネットワークで評価する葉の数
     fpu: 未訪問の手の Q の値
     fpu_reduction: 指定すると, 未訪問の手の Q を 訪問済みの手の平均価値 − fpu_reduction × √(訪問済みの手の事前確率の合計) にする
+    prior_cache: ルート以外のノードの事前確率. none なら最初に評価したロジットを使い回し, hand なら手番のプレイヤーの
+                 手札ごとに評価する (az/mcts.py)
     temperature: 0 なら訪問回数が最大の手, 正なら訪問回数^(1/temperature) に比例した確率で手を選ぶ
     device: 推論に使う装置 (cpu / cuda / auto. auto なら GPU があれば cuda. cuda では半精度で推論する)
     rng: random.Random を渡すと, 探索と手の選択の全ての乱数をそこから作る (同じシードなら同じ手を返す)
@@ -129,7 +132,8 @@ def az_move(obs: pybl.Observation, checkpoint: str = CHECKPOINT, num_simulations
         evaluator = _evaluators[(checkpoint, device)] = NetworkEvaluator(_load(checkpoint, device), device)
     result = search(obs, evaluator, num_simulations=int(num_simulations), c_puct=float(c_puct),
                     batch_size=int(batch_size), fpu=float(fpu),
-                    fpu_reduction=None if fpu_reduction is None else float(fpu_reduction), rng=rng)
+                    fpu_reduction=None if fpu_reduction is None else float(fpu_reduction),
+                    prior_cache=str(prior_cache), rng=rng)
     if len(result.moves) == 1:
         return pybl.Move(result.moves[0])
     return pybl.Move(result.sample_move(float(temperature), rng))

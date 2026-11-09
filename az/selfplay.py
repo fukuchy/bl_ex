@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "dirichlet_alpha": 0.3,
     "dirichlet_epsilon": 0.25,
     "temperature_moves": 16,
+    "prior_cache": "none",          # ルート以外のノードの事前確率: none (使い回す) / hand (手札ごとに評価する)
 }
 
 CONFIG_HELP = {
@@ -53,14 +54,17 @@ CONFIG_HELP = {
     "dirichlet_alpha": "ルートに混ぜるディリクレノイズの集中度",
     "dirichlet_epsilon": "ディリクレノイズを混ぜる割合",
     "temperature_moves": "訪問回数に比例した確率で手を選ぶ手数",
+    "prior_cache": "ルート以外のノードの事前確率: none (最初に評価したロジットを使い回す) / hand (手札ごとに評価する)",
 }
 
 
 def add_config_arguments(parser) -> None:
     """自己対戦の設定 (DEFAULT_CONFIG) のコマンドライン引数を加える"""
+    from az.mcts import PRIOR_CACHES
     for key, value in DEFAULT_CONFIG.items():
+        choices = PRIOR_CACHES if key == "prior_cache" else None
         parser.add_argument(f"--{key.replace('_', '-')}", type=float if value is None else type(value), default=value,
-                            help=f"自己対戦の設定: {CONFIG_HELP[key]}")
+                            choices=choices, help=f"自己対戦の設定: {CONFIG_HELP[key]}")
 
 def default_device() -> str:
     import torch
@@ -76,8 +80,9 @@ def load_evaluator(checkpoint: str, device: str = "cpu"):
     return NetworkEvaluator(load_checkpoint(checkpoint, device=device)[0], device)
 
 
-def selfplay_game_steps(game_index: int, seed: int, config: dict):
-    """自己対戦を1局行うジェネレータ. 探索の評価の要求を yield し (mcts.search_steps と同じ形), 記録した局面を返す"""
+def selfplay_game_steps(game_index: int, seed: int, config: dict, stats=None):
+    """自己対戦を1局行うジェネレータ. 探索の評価の要求を yield し (mcts.search_steps と同じ形), 記録した局面を返す.
+    stats: mcts.PriorStats を渡すと, 全ての探索で事前確率の使い回しの度合いを集計する (az.diag_prior)"""
     from az import mcts
     rng = random.Random(seed)
     state = pybl.GameState(seed=rng.getrandbits(64))
@@ -95,7 +100,8 @@ def selfplay_game_steps(game_index: int, seed: int, config: dict):
             obs, num_simulations=config["num_simulations"], c_puct=config["c_puct"],
             batch_size=config["batch_size"], fpu=config["fpu"], fpu_reduction=config.get("fpu_reduction"),
             dirichlet_alpha=config["dirichlet_alpha"],
-            dirichlet_epsilon=config["dirichlet_epsilon"], rng=rng)
+            dirichlet_epsilon=config["dirichlet_epsilon"], prior_cache=config.get("prior_cache", "none"),
+            stats=stats, rng=rng)
         p, s = F.encode(obs)
         planes.append(p.astype(np.uint8))
         scalars.append(s)
@@ -233,7 +239,7 @@ def generate(checkpoint, games: int, out, config: dict | None = None, jobs: int 
     jobs = max(1, min(games, jobs or (len(cpus) if cpus else os.cpu_count()) or 1))
     log(f"自己対戦 {games} 局 ({jobs} プロセス × 同時 {concurrency} 局, 推論 {device}, "
         f"{config['num_simulations']} シミュレーション/手, c_puct {config['c_puct']}, "
-        f"fpu_reduction {config['fpu_reduction']}) → {out}")
+        f"fpu_reduction {config['fpu_reduction']}, prior_cache {config['prior_cache']}) → {out}")
     if F._fast is None:
         log("  (Cython 版が無いので Python 版で探索する. python setup.py build_ext --inplace でビルドすると速くなる)")
 

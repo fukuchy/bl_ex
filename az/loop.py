@@ -8,7 +8,7 @@
     3. ゲーティング: 新しいネットワークと best を gate_games 試合対戦させ, 勝率が gate_threshold 以上なら best を更新する
        (gate_threshold が 0 なら対戦せずに常に更新する)
     4. 既存のエージェントとの比較: eval_every 世代ごとに, best を eval_agents と対戦させる
-    ゲーティングと比較の対戦の az は, 自己対戦と同じ探索の設定 (c_puct, batch_size, fpu, fpu_reduction) を使う
+    ゲーティングと比較の対戦の az は, 自己対戦と同じ探索の設定 (c_puct, batch_size, fpu, fpu_reduction, prior_cache) を使う
     eval_agents には match.py と同じ指定を書ける (例: abdeck az@checkpoint=runs/az4/checkpoints/gen_0005.pt,c_puct=1.0)
 
     python -m az.loop --run runs/az1 --init checkpoints/pretrain.pt --iterations 20 --games 500
@@ -75,12 +75,14 @@ def _train_in_subprocess(task: dict) -> dict:
 
 
 def _az_spec(checkpoint: Path, config: dict, simulations: int, device: str = "cpu") -> str:
-    """対戦に使う az の指定. 探索の設定 (c_puct, batch_size, fpu, fpu_reduction) は自己対戦と同じにする
+    """対戦に使う az の指定. 探索の設定 (c_puct, batch_size, fpu, fpu_reduction, prior_cache) は自己対戦と同じにする
     (ノイズと温度は使わない)"""
     spec = (f"az@checkpoint={checkpoint},num_simulations={simulations},c_puct={config['c_puct']},"
             f"batch_size={config['batch_size']},fpu={config['fpu']},device={device}")
     if config.get("fpu_reduction") is not None:
         spec += f",fpu_reduction={config['fpu_reduction']}"
+    if config.get("prior_cache", "none") != "none":
+        spec += f",prior_cache={config['prior_cache']}"
     return spec
 
 

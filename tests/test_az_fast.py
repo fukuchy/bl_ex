@@ -49,11 +49,13 @@ class RowEvaluator:
         return logits.astype(np.float32), np.tanh(scalars.sum(axis=1) * 0.1 - flat.mean(axis=1)).astype(np.float32)
 
 
+@pytest.mark.parametrize("prior_cache", ["none", "hand"])
 @pytest.mark.parametrize("fpu_reduction", [None, 0.2])
 @pytest.mark.parametrize("seed", range(4))
-def test_search_matches_python(seed, fpu_reduction, monkeypatch):
+def test_search_matches_python(seed, fpu_reduction, prior_cache, monkeypatch):
     states = list(random_states(5, 100 + seed))
-    kwargs = dict(num_simulations=120, batch_size=8, fpu_reduction=fpu_reduction, dirichlet_alpha=0.3)
+    kwargs = dict(num_simulations=120, batch_size=8, fpu_reduction=fpu_reduction, dirichlet_alpha=0.3,
+                  prior_cache=prior_cache)
     fast = [mcts.search(s.observe(s.side_to_move), RowEvaluator(), rng=random.Random(seed), **kwargs)
             for s in states if not s.is_terminal]
     monkeypatch.setattr(mcts, "_select", mcts._select_py)

@@ -106,6 +106,8 @@ cdef class Node:
     cdef public long visits
     cdef public double value_sum
     cdef public object logits
+    cdef public object hand
+    cdef public object cache
 
     def __init__(self, move, player, parent):
         self.move = move
@@ -115,11 +117,13 @@ cdef class Node:
         self.visits = 0
         self.value_sum = 0.0
         self.logits = None
+        self.hand = None
+        self.cache = None
 
 
 def select(Node node, Node root, list root_moves, const double[::1] root_priors, work, double c_puct, double fpu,
-           fpu_reduction=None):
-    """mcts._select と同じ (PUCT で手を選ぶ). node.logits は float32 の配列"""
+           fpu_reduction=None, node_logits=None):
+    """mcts._select と同じ (PUCT で手を選ぶ). node.logits と node_logits (省略時は node.logits を使う) は float32 の配列"""
     cdef Py_ssize_t n, i
     cdef double priors[MAX_MOVES]
     cdef PyObject* kids[MAX_MOVES]
@@ -139,7 +143,7 @@ def select(Node node, Node root, list root_moves, const double[::1] root_priors,
             priors[i] = root_priors[i]
     else:
         legal = work.get_legal_moves()
-        logits = node.logits
+        logits = node.logits if node_logits is None else node_logits
         n = legal.shape[0]
         top = -INFINITY
         for i in range(n):
