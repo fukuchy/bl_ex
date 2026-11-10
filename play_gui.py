@@ -265,6 +265,7 @@ class App:
             self.canvas.tag_bind(tag, "<Enter>", lambda _e: self.canvas.configure(cursor="hand2"))
             self.canvas.tag_bind(tag, "<Leave>", lambda _e: self.canvas.configure(cursor=""))
         root.bind("<Key>", self.on_key)
+        root.report_callback_exception = self.report_error
         root.after(100, self.poll)
 
         self.start(agent_spec, first, seed)
@@ -313,8 +314,22 @@ class App:
         except Exception:
             self.results.put((game_id, None, None, traceback.format_exc()))
 
+    def report_error(self, exc, value, tb) -> None:
+        """画面の処理で起きた例外を, コンソールと画面の両方に出す (黙って操作を受け付けなくなるのを防ぐ)"""
+        text = "".join(traceback.format_exception(exc, value, tb))
+        print(text, flush=True)
+        self.message.configure(text=f"エラー: {value!r} (詳細はコンソール)")
+
     def poll(self) -> None:
         """エージェントの手を受け取る (tkinter は別のスレッドから触れないので, ここで盤面を進める)"""
+        try:
+            self._poll()
+        except Exception:
+            self.report_error(*sys.exc_info())
+        finally:                        # 例外が起きても受け取りを続ける (止まるとエージェントの手が反映されない)
+            self.root.after(100, self.poll)
+
+    def _poll(self) -> None:
         try:
             while True:
                 game_id, move, elapsed, error = self.results.get_nowait()
@@ -337,7 +352,6 @@ class App:
             pass
         if self.thinking_since is not None:
             self.update_status()
-        self.root.after(100, self.poll)
 
     def play(self, move: int) -> None:
         if not self.game.my_turn:
@@ -418,7 +432,8 @@ class App:
     def redraw(self) -> None:
         game = self.game
         state = game.state
-        if self.selected is not None and (not game.my_turn or not state.get_hand(game.me) >> self.selected & 1):
+        # get_hand は numpy.uint64 を返す. NumPy 1.x では uint64 と int のシフトが TypeError になるので int にする
+        if self.selected is not None and (not game.my_turn or not int(state.get_hand(game.me)) >> self.selected & 1):
             self.selected = None
         self.update_status()
         claimed_you = bin(state.get_claimed_flags(game.me)).count("1")

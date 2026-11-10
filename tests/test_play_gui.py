@@ -83,8 +83,9 @@ def test_agent_label():
     assert agent_label("az@checkpoint=runs/az6/checkpoints/gen_0021.pt,device=cuda") == "az (gen_0021)"
 
 
-@pytest.fixture
-def root():
+@pytest.fixture(scope="module")
+def tk_root():
+    """Tk のルートはモジュールで 1 つだけ作る (macOS では作り直すと update が固まることがある)"""
     tk = pytest.importorskip("tkinter")
     try:
         root = tk.Tk()
@@ -93,6 +94,17 @@ def root():
     root.withdraw()
     yield root
     root.destroy()
+
+
+@pytest.fixture
+def root(tk_root):
+    yield tk_root
+    for after_id in tk_root.tk.splitlist(tk_root.tk.call("after", "info")):   # 前のテストの App の poll を止める
+        tk_root.after_cancel(after_id)
+    for child in tk_root.winfo_children():
+        child.destroy()
+    tk_root.withdraw()
+    tk_root.update()
 
 
 def wait_until(root, condition, timeout=20.0):
@@ -162,3 +174,23 @@ def test_app_click_and_new_game(root, monkeypatch):
     assert app.game_id == old_id + 1
     wait_until(root, lambda: app.game.my_turn)
     assert app.game.log[0][1] == "agent"
+
+
+def test_app_keeps_polling_after_error(root, monkeypatch, capsys):
+    """画面の処理で例外が起きても, エージェントの手の受け取りを続け, エラーを画面に出す"""
+    from play_gui import App
+    monkeypatch.setattr("tkinter.messagebox.showinfo", lambda *a, **k: None)
+    app = App(root, "random", "agent", 2)
+    original = app._poll
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("テスト用の例外")
+        original()
+
+    monkeypatch.setattr(app, "_poll", flaky)
+    wait_until(root, lambda: app.game.my_turn)
+    assert "テスト用の例外" in app.message.cget("text")
+    assert "RuntimeError" in capsys.readouterr().out
