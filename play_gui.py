@@ -20,8 +20,12 @@ play_vs_agent.py の GUI 版. Python に付属の tkinter だけを使うので,
 エージェントには公平のため, エージェントから見える情報 (pybl.Observation) のみを渡します
 (state を受け取る答えを見たエージェントには, play_vs_agent.py と同じく本物の局面のコピーを渡す).
 エージェントは別のスレッドで考えるので, 考えている間もウィンドウは固まらない.
+終局すると, 結果と相手の手札をウィンドウの中に表示する (ダイアログは出さない).
+
+画面の処理が 5 秒以上止まると, コンソールに "Timeout" と全スレッドのスタックを出力する (固まったときの調査用).
 """
 import argparse
+import faulthandler
 import queue
 import random
 import sys
@@ -155,6 +159,7 @@ ACCENT = "#2f6fb5"
 YOU = "#2f6fb5"
 AGENT = "#b5462f"
 LAST = "#f2b705"
+HANG_SECONDS = 5                                # 画面の処理がこれ以上止まったら, 全スレッドのスタックを出す
 
 # 盤面の寸法 (ピクセル. 画面の拡大率が 100% のとき. それ以外では App.scale 倍に拡大する)
 MARGIN = 16
@@ -188,16 +193,16 @@ class App:
 
     def __init__(self, root, agent_spec: str, first: str, seed: int | None):
         import tkinter as tk
-        import tkinter.messagebox
         from tkinter import font as tkfont, ttk
 
-        self.tk, self.ttk, self.messagebox = tk, ttk, tkinter.messagebox
+        self.tk, self.ttk = tk, ttk
         self.root = root
         self.game = None
         self.game_id = 0
         self.selected = None          # 選んでいる手札のカード
         self.thinking_since = None
         self.results = queue.Queue()  # エージェントのスレッド → 画面: (game_id, 着手, 思考時間, エラー)
+        self.watchdog = True          # 画面が止まったときにスタックを出すか (コンソールが無ければ False にする)
 
         # Windows の高 DPI の画面 (拡大率 125% など) では, 寸法と文字をその倍率で拡大する
         windows = root.tk.call("tk", "windowingsystem") == "win32"
@@ -266,6 +271,8 @@ class App:
             self.canvas.tag_bind(tag, "<Leave>", lambda _e: self.canvas.configure(cursor=""))
         root.bind("<Key>", self.on_key)
         root.report_callback_exception = self.report_error
+        # 画面の処理が止まったら, C のスレッドが全スレッドのスタックを出す (GIL を持ったまま止まっていても出せる)
+        self.canvas.bind("<Destroy>", lambda _e: faulthandler.cancel_dump_traceback_later())
         root.after(100, self.poll)
 
         self.start(agent_spec, first, seed)
@@ -302,10 +309,6 @@ class App:
             self.thinking_since = time.perf_counter()
             threading.Thread(target=self._think, args=(game, self.game_id), daemon=True).start()
         self.redraw()
-        if game.state.is_terminal:
-            game_id = self.game_id
-            self.root.after(300, lambda: game_id == self.game_id and self.messagebox.showinfo(
-                "対局終了", game.result_text(), parent=self.root))
 
     def _think(self, game: Game, game_id: int) -> None:
         try:
@@ -323,11 +326,21 @@ class App:
     def poll(self) -> None:
         """エージェントの手を受け取る (tkinter は別のスレッドから触れないので, ここで盤面を進める)"""
         try:
+            self.arm_watchdog()
             self._poll()
         except Exception:
             self.report_error(*sys.exc_info())
         finally:                        # 例外が起きても受け取りを続ける (止まるとエージェントの手が反映されない)
             self.root.after(100, self.poll)
+
+    def arm_watchdog(self) -> None:
+        """画面の処理が HANG_SECONDS 秒止まったらスタックを出すよう, 期限を張り直す (poll のたびに呼ぶ)"""
+        if not self.watchdog:
+            return
+        try:
+            faulthandler.dump_traceback_later(HANG_SECONDS, file=sys.__stderr__)
+        except (AttributeError, ValueError, OSError, RuntimeError):   # pythonw などでコンソールが無い
+            self.watchdog = False
 
     def _poll(self) -> None:
         try:
@@ -526,8 +539,23 @@ class App:
             self.draw_card(x, HAND_TOP + 12 - lift, HAND_W, HAND_H - 12, card, font_size=30,
                            dim=game.my_turn and card not in playable, selected=card == self.selected, tags=tags)
             x += HAND_W + 10
+        if state.is_terminal:
+            self.draw_result()
         if self.scale != 1.0:
             c.scale("all", 0, 0, self.scale, self.scale)
+
+    def draw_result(self) -> None:
+        """終局後, 手札の行を覆って結果を表示する"""
+        game = self.game
+        winner = game.state.winner
+        color = YOU if winner == game.me else AGENT if winner == game.opp else MUTED
+        x0, x1 = MARGIN + 60, BOARD_W - MARGIN - 60
+        y0, y1 = HAND_TOP, CANVAS_H - 4                     # 手札の行を覆う
+        self.round_rect(x0, y0, x1, y1, 12, fill="#ffffff", outline=color, width=3)
+        lines = game.result_text().splitlines()
+        self.canvas.create_text((x0 + x1) / 2, y0 + 30, text=lines[0], font=self.px(24, "bold"), fill=color)
+        note = (lines[1] + "　" if len(lines) > 1 else "") + "右の「新しい対局」で続けて対局できます"
+        self.canvas.create_text((x0 + x1) / 2, y1 - 20, text=note, font=self.font_small, fill=MUTED)
 
     def draw_card(self, x, y, w, h, card: int, font_size=16, highlight=False, dim=False, selected=False, tags=()):
         text = pybl.card_to_str(card)

@@ -126,7 +126,6 @@ def click(app, item) -> None:
 
 def test_app_plays_game(root, monkeypatch):
     from play_gui import App
-    monkeypatch.setattr("tkinter.messagebox.showinfo", lambda *a, **k: None)
     app = App(root, "random", "agent", 7)
     root.update()
     while not app.game.state.is_terminal:
@@ -147,7 +146,6 @@ def test_app_plays_game(root, monkeypatch):
 
 def test_app_click_and_new_game(root, monkeypatch):
     from play_gui import App
-    monkeypatch.setattr("tkinter.messagebox.showinfo", lambda *a, **k: None)
     root.deiconify()
     app = App(root, "random", "you", 1)
     root.update()
@@ -179,7 +177,6 @@ def test_app_click_and_new_game(root, monkeypatch):
 def test_app_keeps_polling_after_error(root, monkeypatch, capsys):
     """画面の処理で例外が起きても, エージェントの手の受け取りを続け, エラーを画面に出す"""
     from play_gui import App
-    monkeypatch.setattr("tkinter.messagebox.showinfo", lambda *a, **k: None)
     app = App(root, "random", "agent", 2)
     original = app._poll
     calls = []
@@ -194,3 +191,30 @@ def test_app_keeps_polling_after_error(root, monkeypatch, capsys):
     wait_until(root, lambda: app.game.my_turn)
     assert "テスト用の例外" in app.message.cget("text")
     assert "RuntimeError" in capsys.readouterr().out
+
+
+def test_app_shows_result_in_window(root):
+    """終局したら, ダイアログを出さずにウィンドウの中に結果を表示する"""
+    from play_gui import App
+    app = App(root, "random", "you", 6)
+    root.update()
+    while not app.game.state.is_terminal:
+        wait_until(root, lambda: app.game.my_turn or app.game.state.is_terminal)
+        if app.game.my_turn:
+            app.play(app.game.legal_moves()[0])
+    root.update()
+    texts = [app.canvas.itemcget(i, "text") for i in app.canvas.find_all() if app.canvas.type(i) == "text"]
+    assert app.game.result_text().splitlines()[0] in texts
+    assert root.grab_current() is None              # モーダルなダイアログで操作を奪っていない
+
+
+def test_app_dumps_stacks_when_hung(root, monkeypatch, capfd):
+    """画面の処理が止まったら, コンソールに全スレッドのスタックを出す"""
+    import play_gui
+    monkeypatch.setattr(play_gui, "HANG_SECONDS", 1)
+    app = play_gui.App(root, "random", "you", 1)
+    wait_until(root, lambda: True)
+    app.poll()                                      # 期限を 1 秒で張り直す
+    time.sleep(1.5)                                 # 画面のスレッドを止める
+    err = capfd.readouterr().err
+    assert "Timeout" in err and "test_app_dumps_stacks_when_hung" in err
