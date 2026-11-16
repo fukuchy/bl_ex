@@ -218,3 +218,28 @@ def test_app_dumps_stacks_when_hung(root, monkeypatch, capfd):
     time.sleep(1.5)                                 # 画面のスレッドを止める
     err = capfd.readouterr().err
     assert "Timeout" in err and "test_app_dumps_stacks_when_hung" in err
+
+
+def test_app_board_follows_window_size(root):
+    """ウィンドウを大きくすると盤面が拡大され, 右の欄の幅は変わらない"""
+    from play_gui import App
+    root.deiconify()
+    app = App(root, "random", "you", 1)
+    root.update()
+    side = root.grid_slaves(row=0, column=1)[0]
+
+    def card_width():
+        x0, _, x1, _ = app.canvas.bbox(app.canvas.find_withtag("hand")[0])
+        return x1 - x0
+
+    small_zoom, small_card, side_width = app.zoom, card_width(), side.winfo_width()
+    try:
+        root.geometry(f"{root.winfo_width() * 2}x{root.winfo_height() * 2}")
+        wait_until(root, lambda: app.zoom > small_zoom * 1.5)
+        root.update()
+        assert card_width() > small_card * 1.5
+        assert side.winfo_width() == side_width
+        x0, y0, x1, y1 = app.canvas.bbox("all")         # 盤面は canvas からはみ出さない
+        assert x0 >= 0 and y0 >= 0 and x1 <= app.canvas.winfo_width() + 1 and y1 <= app.canvas.winfo_height() + 1
+    finally:
+        root.geometry("")

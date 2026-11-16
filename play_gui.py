@@ -161,7 +161,7 @@ AGENT = "#b5462f"
 LAST = "#f2b705"
 HANG_SECONDS = 5                                # 画面の処理がこれ以上止まったら, 全スレッドのスタックを出す
 
-# 盤面の寸法 (ピクセル. 画面の拡大率が 100% のとき. それ以外では App.scale 倍に拡大する)
+# 盤面の寸法 (ピクセル. 拡大率 1 のとき. 実際は canvas の大きさに合わせて App.zoom 倍に拡大する)
 MARGIN = 16
 COL_W = 84
 COL_GAP = 8
@@ -215,12 +215,19 @@ class App:
         root.title("バトルライン")
         root.configure(bg=BG)
 
+        # 盤面はウィンドウの大きさに合わせて拡大・縮小し, 右の欄は幅を変えずに縦にだけ伸ばす
+        self.zoom = self.scale                      # 盤面の拡大率 (canvas の大きさで決まる)
+        self.offset = (0, 0)                        # 盤面を canvas の中央に寄せるためのずらし
+        self.redraw_pending = False
         self.canvas = tk.Canvas(root, width=round(BOARD_W * self.scale), height=round(CANVAS_H * self.scale), bg=BG, highlightthickness=0)
-        self.canvas.grid(row=0, column=0, sticky="n", padx=(4, 0), pady=4)
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
         side = tk.Frame(root, bg=BG)
-        side.grid(row=0, column=1, sticky="nsew", padx=12, pady=12)
-        root.grid_columnconfigure(1, weight=1, minsize=300)
+        side.grid(row=0, column=1, sticky="ns", padx=12, pady=12)
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_columnconfigure(1, weight=0, minsize=round(300 * self.scale))
         root.grid_rowconfigure(0, weight=1)
+        root.minsize(round((BOARD_W / 2 + 330) * self.scale), round(CANVAS_H / 2 * self.scale))
+        self.canvas.bind("<Configure>", self.on_resize, add="+")
 
         self.status = tk.Label(side, text="", font=self.font_status, bg=BG, fg=INK, anchor="w", justify="left")
         self.status.pack(fill="x")
@@ -278,8 +285,35 @@ class App:
         self.start(agent_spec, first, seed)
 
     def px(self, size: float, *style) -> tuple:
-        """文字の大きさをピクセルで指定したフォント (拡大率を掛ける)"""
+        """文字の大きさをピクセルで指定したフォント (画面の拡大率を掛ける). 右の欄に使う"""
         return (self.family, -round(size * self.scale)) + style
+
+    def cpx(self, size: float, *style) -> tuple:
+        """盤面の文字のフォント (盤面の拡大率を掛ける)"""
+        return (self.family, -max(1, round(size * self.zoom))) + style
+
+    def fit_board(self) -> bool:
+        """canvas の大きさから盤面の拡大率とずらしを決める. 変わったら True"""
+        c = self.canvas
+        w, h = c.winfo_width(), c.winfo_height()
+        if w <= 1 or h <= 1:                        # まだ表示されていない
+            w, h = int(c.cget("width")), int(c.cget("height"))
+        zoom = max(0.1, min(w / BOARD_W, h / CANVAS_H))
+        offset = (round((w - BOARD_W * zoom) / 2), round((h - CANVAS_H * zoom) / 2))
+        changed = (zoom, offset) != (self.zoom, self.offset)
+        self.zoom, self.offset = zoom, offset
+        return changed
+
+    def on_resize(self, _event) -> None:
+        """ウィンドウの大きさが変わったら, 盤面を描き直す (続けて来るイベントは 1 回にまとめる)"""
+        if not self.redraw_pending:
+            self.redraw_pending = True
+            self.root.after_idle(self._redraw_board)
+
+    def _redraw_board(self) -> None:
+        self.redraw_pending = False
+        if self.fit_board() and self.game is not None:
+            self.draw_board()
 
     # --- 対局の進行 -----------------------------------------------------------
 
@@ -462,6 +496,7 @@ class App:
         c = self.canvas
         game = self.game
         state = game.state
+        self.fit_board()
         c.delete("all")
         targets = self.target_flags()
         last = None
@@ -469,18 +504,18 @@ class App:
             last = int(pybl.move_card(game.last_move[1]))
 
         # 相手の手札 (終局後は表を見せる)
-        c.create_text(MARGIN, MARGIN + 14, text=f"{game.label} の陣地", anchor="w", font=self.font_bold, fill=AGENT)
+        c.create_text(MARGIN, MARGIN + 14, text=f"{game.label} の陣地", anchor="w", font=self.cpx(14, "bold"), fill=AGENT)
         if state.is_terminal:
             cards = sorted_cards(state.get_hand(game.opp))
             x = BOARD_W - MARGIN - len(cards) * 40
             c.create_text(x - 8, MARGIN + 14, text="手札:" if cards else "手札: なし", anchor="e",
-                          font=self.font_small, fill=MUTED)
+                          font=self.cpx(12), fill=MUTED)
             for k, card in enumerate(cards):
                 self.draw_card(x + k * 40, MARGIN, 36, 30, int(card), font_size=14)
         else:
             count = int(state.get_hand_count(game.opp))
             x = BOARD_W - MARGIN - count * 22
-            c.create_text(x - 8, MARGIN + 14, text="手札", anchor="e", font=self.font_small, fill=MUTED)
+            c.create_text(x - 8, MARGIN + 14, text="手札", anchor="e", font=self.cpx(12), fill=MUTED)
             for k in range(count):
                 self.round_rect(x + k * 22, MARGIN + 1, x + k * 22 + 18, MARGIN + 29, 3, fill="#6d6559",
                                 outline="#8a8274")
@@ -510,7 +545,7 @@ class App:
                     label_y = top + 2 * (CARD_H + CARD_GAP) + CARD_H + 17
                 c.create_text((x0 + x1) / 2, label_y, text=game.formation(i, who).replace(" ", "\n合計 "),
                               tags=tags, justify="center", fill=INK if owner == player else MUTED,
-                              font=self.px(10, *(("bold",) if owner == player else ())))
+                              font=self.cpx(10, *(("bold",) if owner == player else ())))
             # フラッグ (確保した側に寄せて, その色で塗る)
             cx, cy, r = (x0 + x1) / 2, FLAG_TOP + FLAG_H / 2, 17
             if owner == game.me:
@@ -520,15 +555,15 @@ class App:
             else:
                 fill, ink, line = "#ffffff", MUTED, SLOT
             c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=line, width=2, tags=tags)
-            c.create_text(cx, cy, text=str(i + 1), font=self.font_bold, fill=ink, tags=tags)
+            c.create_text(cx, cy, text=str(i + 1), font=self.cpx(14, "bold"), fill=ink, tags=tags)
 
         # あなたの手札
-        c.create_text(MARGIN, BOARD_BOTTOM + 17, text="あなた の陣地 / 手札", anchor="w", font=self.font_bold, fill=YOU)
+        c.create_text(MARGIN, BOARD_BOTTOM + 17, text="あなた の陣地 / 手札", anchor="w", font=self.cpx(14, "bold"), fill=YOU)
         hint = ""
         if game.my_turn:
             hint = ("カードをクリックして選ぶ" if self.selected is None
                     else "置くフラッグの列をクリック (数字キーでも可、Esc で取り消し)")
-        c.create_text(BOARD_W - MARGIN, BOARD_BOTTOM + 17, text=hint, anchor="e", font=self.font_small, fill=MUTED)
+        c.create_text(BOARD_W - MARGIN, BOARD_BOTTOM + 17, text=hint, anchor="e", font=self.cpx(12), fill=MUTED)
         hand = [int(card) for card in sorted_cards(state.get_hand(game.me))]
         playable = {int(pybl.move_card(m)) for m in game.legal_moves() if m != pybl.PASS_MOVE}
         total = len(hand) * HAND_W + max(len(hand) - 1, 0) * 10
@@ -541,8 +576,11 @@ class App:
             x += HAND_W + 10
         if state.is_terminal:
             self.draw_result()
-        if self.scale != 1.0:
-            c.scale("all", 0, 0, self.scale, self.scale)
+        # 盤面は 100% の寸法で描いてから, canvas の大きさに合わせて拡大し, 中央に寄せる
+        if self.zoom != 1.0:
+            c.scale("all", 0, 0, self.zoom, self.zoom)
+        if self.offset != (0, 0):
+            c.move("all", *self.offset)
 
     def draw_result(self) -> None:
         """終局後, 手札の行を覆って結果を表示する"""
@@ -553,9 +591,9 @@ class App:
         y0, y1 = HAND_TOP, CANVAS_H - 4                     # 手札の行を覆う
         self.round_rect(x0, y0, x1, y1, 12, fill="#ffffff", outline=color, width=3)
         lines = game.result_text().splitlines()
-        self.canvas.create_text((x0 + x1) / 2, y0 + 30, text=lines[0], font=self.px(24, "bold"), fill=color)
+        self.canvas.create_text((x0 + x1) / 2, y0 + 30, text=lines[0], font=self.cpx(24, "bold"), fill=color)
         note = (lines[1] + "　" if len(lines) > 1 else "") + "右の「新しい対局」で続けて対局できます"
-        self.canvas.create_text((x0 + x1) / 2, y1 - 20, text=note, font=self.font_small, fill=MUTED)
+        self.canvas.create_text((x0 + x1) / 2, y1 - 20, text=note, font=self.cpx(12), fill=MUTED)
 
     def draw_card(self, x, y, w, h, card: int, font_size=16, highlight=False, dim=False, selected=False, tags=()):
         text = pybl.card_to_str(card)
@@ -570,9 +608,9 @@ class App:
         elif highlight:
             outline, width = LAST, 4
         self.round_rect(x, y, x + w, y + h, 6, fill=fill, outline=outline, width=width, tags=tags)
-        self.canvas.create_text(x + 6, y + 3, text=color, anchor="nw", font=self.px(max(9, font_size // 2)),
+        self.canvas.create_text(x + 6, y + 3, text=color, anchor="nw", font=self.cpx(max(9, font_size // 2)),
                                 fill=ink, tags=tags)
-        self.canvas.create_text(x + w / 2, y + h / 2 + 2, text=rank, font=self.px(font_size, "bold"),
+        self.canvas.create_text(x + w / 2, y + h / 2 + 2, text=rank, font=self.cpx(font_size, "bold"),
                                 fill=ink, tags=tags)
 
     def round_rect(self, x0, y0, x1, y1, r, **kwargs):
