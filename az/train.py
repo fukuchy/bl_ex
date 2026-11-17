@@ -48,14 +48,16 @@ def load_dataset(directories: list) -> dict:
 def fit(model, dataset: dict, *, out, epochs: int = 1, batch_size: int = 1024, lr: float = 1e-3,
         weight_decay: float = 1e-4, value_weight: float = 1.0, q_weight: float = 0.0, augment: bool = True,
         val_ratio: float = 0.05, device=None, seed: int = 0, keep_best: bool = True, amp: bool = False, log=print,
-        **extra) -> dict:
-    """model を dataset で学習し, out に保存する. 最後のエポックの検証の結果を返す.
+        on_epoch=None, **extra) -> dict:
+    """model を dataset で学習し, out に保存する (out が None なら保存しない). 最後のエポックの検証の結果を返す.
 
     value_weight: 損失における価値の二乗誤差の重み
     q_weight: 価値の正解を (1 - q_weight) × z + q_weight × q にする (データに q がある場合のみ)
     keep_best: True なら検証の損失が最も小さいエポックを保存し, False なら最後のエポックを保存する
     amp: True なら混合精度 (bf16 の autocast) で順伝播する. 重みと最適化の状態は fp32 のまま.
          cuda では行列の積に TF32 も使う. bf16 を使えない GPU では fp32 で学習する
+    on_epoch: エポックごとに on_epoch(model, info) を呼ぶ (info: epoch, train_loss, val, lr, seconds).
+              呼ばれる間 model は学習の状態 (train) のまま
     extra: チェックポイントに一緒に保存する情報
     """
     import torch
@@ -166,7 +168,7 @@ def fit(model, dataset: dict, *, out, epochs: int = 1, batch_size: int = 1024, l
         val = evaluate(val_set)
         mark = ""
         # keep_best なら検証の損失が最小のエポックを, そうでなければ (または検証データが無ければ) 毎エポック保存する
-        if not (keep_best and val) or val["loss"] < best:
+        if out is not None and (not (keep_best and val) or val["loss"] < best):
             if val:
                 best = min(best, val["loss"])
             Path(out).parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +178,9 @@ def fit(model, dataset: dict, *, out, epochs: int = 1, batch_size: int = 1024, l
                     f"正解の手との一致率 {val['acc'] * 100:.1f}%") if val else "検証データなし"
         log(f"epoch {epoch:3d}  学習の損失 {running / steps_per_epoch:.4f}  |  {val_text}"
             f"  [{time.perf_counter() - start_time:.0f} 秒]{mark}")
+        if on_epoch is not None:
+            on_epoch(model, {"epoch": epoch, "train_loss": running / steps_per_epoch, "val": val,
+                             "lr": scheduler.get_last_lr()[0], "seconds": time.perf_counter() - start_time})
     model.eval()
     return {"train_loss": running / steps_per_epoch, "val": val}
 
