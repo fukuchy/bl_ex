@@ -141,7 +141,7 @@ def train(args) -> None:
           f"価値の損失の重み {args.value_weight}", flush=True)
     fit(model, load_dataset(args.data), out=args.out, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         weight_decay=args.weight_decay, value_weight=args.value_weight, augment=not args.no_augment,
-        val_ratio=args.val_ratio, device=args.device, seed=args.seed, keep_best=True,
+        val_ratio=args.val_ratio, device=args.device, seed=args.seed, keep_best=True, amp=args.amp,
         log=lambda text: print(text, flush=True), kind="pretrain", data=args.data)
     print(f"検証の損失が最も小さかったネットワークを {args.out} に保存しました")
 
@@ -180,6 +180,7 @@ def main():
     t.add_argument("--no-augment", action="store_true", help="対称変換によるデータ拡張をしない")
     t.add_argument("--device", default=None, help="cuda / cpu (省略時は GPU があれば cuda)")
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--amp", action="store_true", help="混合精度 (bf16) で学習する")
 
     args = parser.parse_args()
     if args.command == "generate":

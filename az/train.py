@@ -47,12 +47,15 @@ def load_dataset(directories: list) -> dict:
 
 def fit(model, dataset: dict, *, out, epochs: int = 1, batch_size: int = 1024, lr: float = 1e-3,
         weight_decay: float = 1e-4, value_weight: float = 1.0, q_weight: float = 0.0, augment: bool = True,
-        val_ratio: float = 0.05, device=None, seed: int = 0, keep_best: bool = True, log=print, **extra) -> dict:
+        val_ratio: float = 0.05, device=None, seed: int = 0, keep_best: bool = True, amp: bool = False, log=print,
+        **extra) -> dict:
     """model を dataset で学習し, out に保存する. 最後のエポックの検証の結果を返す.
 
     value_weight: 損失における価値の二乗誤差の重み
     q_weight: 価値の正解を (1 - q_weight) × z + q_weight × q にする (データに q がある場合のみ)
     keep_best: True なら検証の損失が最も小さいエポックを保存し, False なら最後のエポックを保存する
+    amp: True なら混合精度 (bf16 の autocast) で順伝播する. 重みと最適化の状態は fp32 のまま.
+         cuda では行列の積に TF32 も使う. bf16 を使えない GPU では fp32 で学習する
     extra: チェックポイントに一緒に保存する情報
     """
     import torch
@@ -61,6 +64,21 @@ def fit(model, dataset: dict, *, out, epochs: int = 1, batch_size: int = 1024, l
     device = torch.device(device) if device else default_device()
     torch.manual_seed(seed)
     model = model.to(device).train()
+    if amp and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        log("この GPU は bf16 を使えないため, 混合精度を使わずに学習します")
+        amp = False
+    if amp and device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    def forward(planes, scalars):
+        """順伝播. 混合精度なら bf16 で計算し, 損失は fp32 で計算できるように出力を fp32 に戻す"""
+        if not amp:
+            return model(planes, scalars)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            logits, value = model(planes, scalars)
+        return logits.float(), value.float()
+
     data = dataset
     soft = "policy" in data
     n = len(data["values"])
@@ -75,7 +93,7 @@ def fit(model, dataset: dict, *, out, epochs: int = 1, batch_size: int = 1024, l
     val_games = set(rng.choice(games, size=num_val, replace=False).tolist()) if num_val > 0 else set()
     is_val = np.isin(data["games"], list(val_games))
     log(f"局面数 {n} (学習 {int((~is_val).sum())}, 検証 {int(is_val.sum())}), 局数 {len(games)}, 装置 {device}, "
-        f"方策の正解 {'訪問回数の分布' if soft else '教師の手'}")
+        f"方策の正解 {'訪問回数の分布' if soft else '教師の手'}, 精度 {'混合精度 (bf16)' if amp else 'fp32'}")
 
     def to_device(idx):
         subset = {
@@ -116,7 +134,7 @@ def fit(model, dataset: dict, *, out, epochs: int = 1, batch_size: int = 1024, l
         for start in range(0, count, 4096):
             idx = torch.arange(start, min(start + 4096, count), device=device)
             planes, scalars, policy, masks, target_values = batch_tensors(subset, idx)
-            logits, value = model(planes, scalars)
+            logits, value = forward(planes, scalars)
             loss, vl, pl = loss_fn(logits, value, policy, target_values, masks, value_weight)
             k = len(idx)
             total["loss"] += loss.item() * k
@@ -137,7 +155,7 @@ def fit(model, dataset: dict, *, out, epochs: int = 1, batch_size: int = 1024, l
             planes, scalars, policy, masks, target_values = batch_tensors(train_set, idx)
             if augmenter:
                 planes, scalars, policy, masks = augmenter(planes, scalars, policy, masks)
-            logits, value = model(planes, scalars)
+            logits, value = forward(planes, scalars)
             loss, _, _ = loss_fn(logits, value, policy, target_values, masks, value_weight)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -177,6 +195,7 @@ def main():
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--amp", action="store_true", help="混合精度 (bf16) で学習する")
     args = parser.parse_args()
 
     from az.model import load_checkpoint
@@ -184,7 +203,7 @@ def main():
     fit(model, load_dataset(args.data), out=args.out, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         weight_decay=args.weight_decay, value_weight=args.value_weight, q_weight=args.q_weight,
         augment=not args.no_augment, val_ratio=args.val_ratio, device=args.device, seed=args.seed,
-        keep_best=False, kind="selfplay", data=[str(d) for d in args.data], init=str(args.init))
+        keep_best=False, amp=args.amp, kind="selfplay", data=[str(d) for d in args.data], init=str(args.init))
 
 
 if __name__ == "__main__":

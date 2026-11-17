@@ -63,6 +63,23 @@ def test_generate_and_fit(checkpoint, tmp_path):
     assert ckpt["epoch"] == 1
 
 
+def test_fit_with_mixed_precision(checkpoint, tmp_path):
+    """混合精度 (bf16) でも学習でき, 保存される重みは fp32 で, 損失は fp32 の場合と近い"""
+    out = tmp_path / "data"
+    selfplay.generate(checkpoint, 2, out, small_config(), jobs=1, seed=1, log=lambda *_: None)
+    data = load_dataset([out])
+    results = {}
+    for amp in (False, True):
+        model, _ = load_checkpoint(checkpoint)
+        new = tmp_path / f"amp_{amp}.pt"
+        results[amp] = fit(model, data, out=new, epochs=1, batch_size=32, device="cpu", keep_best=False,
+                           val_ratio=0.5, amp=amp, log=lambda *_: None)
+        loaded, _ = load_checkpoint(new)
+        assert all(p.dtype == torch.float32 for p in loaded.parameters())
+        assert np.isfinite(results[amp]["train_loss"])
+    assert abs(results[True]["val"]["loss"] - results[False]["val"]["loss"]) < 0.1
+
+
 class RowEvaluator:
     """各局面の入力だけから決まる値を返すダミーの評価器 (まとめ方によらず同じ結果になる). 呼び出しの大きさを記録する"""
 

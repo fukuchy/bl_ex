@@ -63,7 +63,7 @@ def _train(task: dict) -> dict:
     result = fit(model, load_dataset(task["data"]), out=task["out"], epochs=task["epochs"],
                  batch_size=task["batch_size"], lr=task["lr"], weight_decay=task["weight_decay"],
                  value_weight=task["value_weight"], q_weight=task["q_weight"], device=task["device"],
-                 seed=task["generation"], keep_best=False, log=lambda text: _log(run, text), kind="selfplay",
+                 amp=task.get("amp", False), seed=task["generation"], keep_best=False, log=lambda text: _log(run, text), kind="selfplay",
                  generation=task["generation"], data=task["data"])
     return {"train_loss": float(result["train_loss"]), "val": result["val"]}
 
@@ -115,6 +115,7 @@ def main():
     parser.add_argument("-j", "--jobs", type=int, default=0, help="自己対戦と対戦の並列化数")
     parser.add_argument("--affinity", default=os.environ.get("BL_AFFINITY"))
     parser.add_argument("--device", default=None, help="学習に使う装置 (cuda / cpu)")
+    parser.add_argument("--amp", action="store_true", help="学習を混合精度 (bf16) で行う")
     parser.add_argument("--selfplay-device", default=None,
                         help="自己対戦の推論に使う装置 (cuda / cpu, 省略時は GPU があれば cuda)")
     parser.add_argument("--eval-device", default="cpu",
@@ -182,7 +183,8 @@ def main():
             "run": str(run), "init": str(checkpoint(gen - 1)), "out": str(checkpoint(gen)),
             "data": [str(d) for d in window], "generation": gen, "epochs": args.epochs,
             "batch_size": args.train_batch_size, "lr": args.lr, "weight_decay": args.weight_decay,
-            "value_weight": args.value_weight, "q_weight": args.q_weight, "device": args.device})
+            "value_weight": args.value_weight, "q_weight": args.q_weight, "device": args.device,
+            "amp": args.amp})
         val = fit_result["val"] or {}
         row.update(train_seconds=round(time.perf_counter() - start), train_loss=round(fit_result["train_loss"], 4),
                    val_value_loss=round(val.get("value", float("nan")), 4),
