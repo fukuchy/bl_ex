@@ -35,6 +35,7 @@ def test_selfplay_game_record(checkpoint, seed):
     assert np.all(policy[~record["masks"]] == 0)              # 合法手以外に確率は無い
     assert np.all(record["masks"].sum(1) > 1)                # 選択の余地が無い局面は記録しない
     assert np.all(np.abs(record["q"]) <= 1 + 1e-6)
+    assert record["prior_agree"].shape == (n,) and record["prior_agree"].dtype == bool
     # 勝敗の向き: 勝者の局面は +1, 敗者の局面は -1 (引き分けは 0)
     winner = int(record["winner"][0])
     first = record["scalars"][:, F.SCALAR_FIRST_PLAYER]
@@ -52,6 +53,7 @@ def test_generate_and_fit(checkpoint, tmp_path):
     out = tmp_path / "data"
     stats = selfplay.generate(checkpoint, 4, out, small_config(), jobs=1, seed=0, save_every=2, log=lambda *_: None)
     assert stats["games"] == 4 and len(list(out.glob("*.npz"))) == 2
+    assert 0 <= stats["prior_agree"] <= 1 and stats["policy_entropy"] >= 0
     data = load_dataset([out])
     assert len(data["values"]) == stats["positions"] and "policy" in data and "q" in data
     model, _ = load_checkpoint(checkpoint)
@@ -155,3 +157,8 @@ def test_loop_az_spec_uses_selfplay_search_settings():
     kwargs = match.load_agent(_az_spec("net.pt", {**config, "fpu_reduction": 0.2}, 100, "cuda")).kwargs
     assert kwargs == {"checkpoint": "net.pt", "num_simulations": 100, "c_puct": 1.0, "batch_size": 16, "fpu": 0.0,
                       "device": "cuda", "fpu_reduction": 0.2}
+
+
+def test_policy_entropy():
+    policy = np.array([[1.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.0, 0.0], [0.25, 0.25, 0.25, 0.25]], dtype=np.float16)
+    assert np.allclose(selfplay.policy_entropy(policy), [0.0, np.log(2), np.log(4)])

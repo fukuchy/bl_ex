@@ -82,7 +82,7 @@ def selfplay_game_steps(game_index: int, seed: int, config: dict):
     rng = random.Random(seed)
     state = pybl.GameState(seed=rng.getrandbits(64))
 
-    planes, scalars, masks, policies, qs, players = [], [], [], [], [], []
+    planes, scalars, masks, policies, qs, players, agrees = [], [], [], [], [], [], []
     decisions = 0
     while not state.is_terminal:
         player = state.side_to_move
@@ -103,6 +103,7 @@ def selfplay_game_steps(game_index: int, seed: int, config: dict):
         policies.append(result.policy.astype(np.float16))
         qs.append(result.root_value)
         players.append(int(player))
+        agrees.append(result.prior_agrees())
         temperature = 1.0 if decisions < config["temperature_moves"] else 0.0
         state.play(result.sample_move(temperature, rng))
         decisions += 1
@@ -119,6 +120,7 @@ def selfplay_game_steps(game_index: int, seed: int, config: dict):
         "values": np.array(values, dtype=np.float32),
         "games": np.full(n, game_index, dtype=np.int32),
         "winner": np.full(n, int(winner), dtype=np.int8),
+        "prior_agree": np.array(agrees, dtype=bool),     # 探索で選んだ手がネットワークの最善手と同じか
     }
 
 
@@ -239,16 +241,30 @@ def generate(checkpoint, games: int, out, config: dict | None = None, jobs: int 
 
     start = time.perf_counter()
     buffer, part, positions = [], 0, 0
+    agree, entropy = 0, 0.0
     for done, record in enumerate(_records(tasks, checkpoint, device, jobs, concurrency), 1):
         buffer.append(record)
         positions += len(record["values"])
+        agree += int(record["prior_agree"].sum())
+        entropy += float(policy_entropy(record["policy"]).sum())
         if len(buffer) >= save_every or done == games:
             np.savez_compressed(out / f"part_{part:04d}.npz", **concat(buffer))
             buffer, part = [], part + 1
             elapsed = time.perf_counter() - start
             log(f"  {done}/{games} 局 ({positions} 局面) [経過 {elapsed:.0f} 秒, "
                 f"残り約 {elapsed / done * (games - done):.0f} 秒]")
-    return {"games": games, "positions": positions, "seconds": time.perf_counter() - start}
+    stats = {"games": games, "positions": positions, "seconds": time.perf_counter() - start,
+             "prior_agree": agree / max(positions, 1), "policy_entropy": entropy / max(positions, 1)}
+    log(f"  探索で選んだ手がネットワークの最善手と同じ割合 {stats['prior_agree'] * 100:.1f}%, "
+        f"訪問回数の分布のエントロピー H(π) {stats['policy_entropy']:.3f}")
+    return stats
+
+
+def policy_entropy(policy: np.ndarray) -> np.ndarray:
+    """各局面の訪問回数の分布 π のエントロピー (自然対数)"""
+    p = policy.astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return -np.where(p > 0, p * np.log(p), 0.0).sum(axis=1)
 
 
 def main():

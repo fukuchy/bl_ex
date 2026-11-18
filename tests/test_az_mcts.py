@@ -254,3 +254,29 @@ def test_az_oracle_move_via_match(tmp_path):
         move = agent.choose(state.observe(state.side_to_move), rng, state)
         assert state.is_legal(move)
         state.play(move)
+
+
+class PeakedEvaluator(UniformEvaluator):
+    """方策は1つの行動 (番号が最小の合法手を選びやすいよう, 行動の番号が小さいほど大きいロジット), 価値は 0"""
+
+    def __call__(self, planes, scalars):
+        logits, values = super().__call__(planes, scalars)
+        return logits - np.arange(F.NUM_ACTIONS, dtype=np.float32) * 0.05, values
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_search_result_keeps_prior_without_noise(seed):
+    """SearchResult.prior はディリクレノイズを混ぜる前のネットワークの事前確率 (代表の手ごとの合計)"""
+    state = random_position(seed)
+    obs = state.observe(state.side_to_move)
+    result = mcts.search(obs, PeakedEvaluator(), num_simulations=30, batch_size=4, dirichlet_alpha=0.3,
+                         dirichlet_epsilon=0.25, rng=random.Random(seed))
+    legal = obs.get_legal_moves()
+    logits = -legal.astype(np.float64) * 0.05
+    probs = np.exp(logits - logits.max())
+    probs /= probs.sum()
+    assert result.prior is not None and np.isclose(result.prior.sum(), 1.0)
+    assert len(result.prior) == len(result.moves)
+    # 事前確率が最大の代表の手は, 番号が最小の合法手を含む
+    assert result.prior.max() >= probs.max() - 1e-9
+    assert result.prior_agrees() == (int(result.moves[int(np.argmax(result.prior))]) == result.best_move())

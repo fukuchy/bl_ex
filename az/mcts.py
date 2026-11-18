@@ -80,6 +80,11 @@ class SearchResult:
     q_values: np.ndarray    # 各手の平均価値 (自分から見た値, -1〜1. 未訪問は 0)
     policy: np.ndarray      # 訪問回数の分布を 541 通りの行動に戻したもの (同等な手には均等に分ける)
     root_value: float       # ルートの価値の推定 (自分から見た値)
+    prior: np.ndarray | None = None     # 各手のネットワークの事前確率 (ディリクレノイズを混ぜる前)
+
+    def prior_agrees(self) -> bool:
+        """探索で選んだ手 (best_move) が, ネットワークの事前確率が最大の手と同じか"""
+        return self.prior is not None and int(self.moves[int(np.argmax(self.prior))]) == self.best_move()
 
     def best_move(self) -> int:
         """訪問回数が最大の手 (同数なら平均価値が大きい手)"""
@@ -188,6 +193,7 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
     legal = obs.get_legal_moves()
     probs = dict(zip(legal.tolist(), _softmax(logits[0][legal])))
     root_prior = np.array([sum(probs[m] for m in classes[r]) for r in root_moves])
+    net_prior = root_prior.copy()
     if dirichlet_alpha > 0 and len(root_moves) > 1:
         noise = np.random.default_rng(rng.getrandbits(64)).dirichlet([dirichlet_alpha] * len(root_moves))
         root_prior = (1 - dirichlet_epsilon) * root_prior + dirichlet_epsilon * noise
@@ -257,7 +263,7 @@ def search_steps(obs: pybl.Observation, num_simulations: int = 200, c_puct: floa
                 policy[m] = n / total / len(classes[rep])
     if total > 0:
         root_value = float((visits * q_values).sum() / total)
-    return SearchResult(root_moves, visits, q_values, policy, root_value)
+    return SearchResult(root_moves, visits, q_values, policy, root_value, net_prior)
 
 
 def revealed_world_sampler(state, reveal: str = "hand"):

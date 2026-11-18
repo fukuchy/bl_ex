@@ -8,6 +8,9 @@
     3. ゲーティング: 新しいネットワークと best を gate_games 試合対戦させ, 勝率が gate_threshold 以上なら best を更新する
        (gate_threshold が 0 なら対戦せずに常に更新する)
     4. 既存のエージェントとの比較: eval_every 世代ごとに, best を eval_agents と対戦させる
+    5. (--fpu-auto のとき) fpu_reduction の調節: 自己対戦で「探索で選んだ手がネットワークの最善手と同じだった割合」
+       (prior_agree) を測り, fpu_target ± fpu_band より大きければ fpu_reduction を fpu_step 下げ (探索を広げる),
+       小さければ上げる (探索を絞る). 範囲は fpu_min〜fpu_max. 新しい値は次の世代の自己対戦・ゲーティング・評価から使う
     ゲーティングと比較の対戦の az は, 自己対戦と同じ探索の設定 (c_puct, batch_size, fpu, fpu_reduction) を使う
     eval_agents には match.py と同じ指定を書ける (例: abdeck az@checkpoint=runs/az4/checkpoints/gen_0005.pt,c_puct=1.0)
 
@@ -85,12 +88,39 @@ def _az_spec(checkpoint: Path, config: dict, simulations: int, device: str = "cp
 
 
 def _append_csv(path: Path, row: dict) -> None:
+    """row を CSV に追記する. 列が既存の見出しと違えば, 列を合わせて書き直す (無い値は空欄)"""
+    if path.exists():
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            old_fields = list(reader.fieldnames or [])
+            if old_fields != list(row):
+                rows = list(reader)
+                fields = list(row) + [k for k in old_fields if k not in row]
+                with open(path, "w", newline="", encoding="utf-8") as out:
+                    writer = csv.DictWriter(out, fieldnames=fields, restval="")
+                    writer.writeheader()
+                    writer.writerows(rows + [row])
+                return
     exists = path.exists()
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row))
         if not exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def adjust_fpu_reduction(current: float, agree: float, target: float, band: float, step: float,
+                         low: float, high: float) -> float:
+    """自己対戦の prior_agree (探索で選んだ手がネットワークの最善手と同じ割合) から次の fpu_reduction を決める.
+
+    探索がネットワークの手をなぞるだけ (agree が大きい) なら fpu_reduction を下げて未訪問の手を調べやすくし,
+    探索がネットワークの手を覆しすぎる (agree が小さい) なら上げて事前確率の高い手に絞る
+    """
+    if agree > target + band:
+        current -= step
+    elif agree < target - band:
+        current += step
+    return round(min(max(current, low), high), 6)
 
 
 def main():
@@ -122,6 +152,14 @@ def main():
                         help="ゲーティングと評価の対戦で az の推論に使う装置 (cpu / cuda / auto)")
     parser.add_argument("--concurrency", type=int, default=0,
                         help="自己対戦の1プロセスで同時に進める局の数 (0 なら cuda で 32, cpu で 1)")
+    parser.add_argument("--fpu-auto", action="store_true",
+                        help="fpu_reduction を自己対戦の prior_agree から世代ごとに自動で調節する "
+                             "(初期値は --fpu-reduction, 省略時は 0.2. 再開時は state.json の値)")
+    parser.add_argument("--fpu-target", type=float, default=0.70, help="--fpu-auto: prior_agree の目標")
+    parser.add_argument("--fpu-band", type=float, default=0.05, help="--fpu-auto: 目標から何だけずれたら調節するか")
+    parser.add_argument("--fpu-step", type=float, default=0.05, help="--fpu-auto: 1世代で変える量")
+    parser.add_argument("--fpu-min", type=float, default=0.0, help="--fpu-auto: fpu_reduction の下限")
+    parser.add_argument("--fpu-max", type=float, default=0.4, help="--fpu-auto: fpu_reduction の上限")
     selfplay.add_config_arguments(parser)
     args = parser.parse_args()
 
@@ -156,6 +194,15 @@ def main():
         (run / "config.json").write_text(json.dumps(vars(args), ensure_ascii=False, indent=2), encoding="utf-8")
         state_path.write_text(json.dumps(state), encoding="utf-8")
 
+    if args.fpu_auto:
+        if "fpu_reduction" in state:
+            config["fpu_reduction"] = state["fpu_reduction"]
+        elif config["fpu_reduction"] is None:
+            config["fpu_reduction"] = 0.2
+        config["fpu_reduction"] = min(max(config["fpu_reduction"], args.fpu_min), args.fpu_max)
+        _log(run, f"fpu_reduction を自動で調節する: 今の値 {config['fpu_reduction']}, prior_agree の目標 "
+                  f"{args.fpu_target} ± {args.fpu_band}, 1世代で ±{args.fpu_step}, 範囲 {args.fpu_min}〜{args.fpu_max}")
+
     checkpoint = lambda g: run / "checkpoints" / f"gen_{g:04d}.pt"
     data_dir = lambda g: run / "data" / f"gen_{g:04d}"
 
@@ -174,7 +221,9 @@ def main():
         stats = selfplay.generate(checkpoint(best), args.games, data_dir(gen), config, jobs=jobs, affinity=None,
                                   device=args.selfplay_device, concurrency=args.concurrency,
                                   log=lambda text: _log(run, text))
-        row.update(selfplay_games=stats["games"], positions=stats["positions"], selfplay_seconds=round(stats["seconds"]))
+        row.update(selfplay_games=stats["games"], positions=stats["positions"], selfplay_seconds=round(stats["seconds"]),
+                   fpu_reduction="" if config["fpu_reduction"] is None else config["fpu_reduction"],
+                   prior_agree=round(stats["prior_agree"], 4), policy_entropy=round(stats["policy_entropy"], 4))
 
         # 2. 学習 (最新のネットワークから, 直近 window 世代分のデータで)
         window = [data_dir(g) for g in range(max(1, gen - args.window + 1), gen + 1) if data_dir(g).exists()]
@@ -216,6 +265,19 @@ def main():
                 row[key] = round(result["rate"], 4)
             else:
                 row[key] = ""
+
+        # 5. fpu_reduction の調節 (次の世代から使う)
+        if args.fpu_auto:
+            new = adjust_fpu_reduction(config["fpu_reduction"], stats["prior_agree"], args.fpu_target, args.fpu_band,
+                                       args.fpu_step, args.fpu_min, args.fpu_max)
+            if new != config["fpu_reduction"]:
+                _log(run, f"fpu_reduction を {config['fpu_reduction']} → {new} に変える "
+                          f"(prior_agree {stats['prior_agree'] * 100:.1f}%, 目標 {args.fpu_target * 100:.0f}%)")
+            elif stats["prior_agree"] > args.fpu_target + args.fpu_band and new <= args.fpu_min:
+                _log(run, f"fpu_reduction は下限 {args.fpu_min} のまま (prior_agree {stats['prior_agree'] * 100:.1f}% は"
+                          f"目標より大きいが, これ以上は下げない)")
+            config["fpu_reduction"] = new
+            state["fpu_reduction"] = new
 
         state["generation"] = gen
         state_path.write_text(json.dumps(state), encoding="utf-8")
